@@ -11,6 +11,9 @@ const ai = new OpenAI({
 // --- Bot wala number (country code ke sath, + ke baghair) ---
 const BOT_PHONE = "923479858077";
 
+// --- Jab malik khud reply kare to bot kitni der chup rahega (minutes) ---
+const SILENCE_MINUTES = 15;
+
 const MODELS = [
   "z-ai/glm-5.2:free",
   "google/gemma-4-31b-it:free",
@@ -63,7 +66,25 @@ async function getAIReply(messages) {
 }
 
 const chatHistory = {};
+const chatSilence = {};      // jis chat mein malik khud baat kar raha ho
+const pendingBotSend = {};   // bot ne kab send kiya (echo se bachne ke liye)
+const botSentIds = new Set();
+let botPaused = false;
 let pairingShown = false;
+
+function trackBotMsg(sent) {
+  if (sent && sent.key && sent.key.id) {
+    botSentIds.add(sent.key.id);
+    if (botSentIds.size > 1000) {
+      botSentIds.delete(botSentIds.values().next().value);
+    }
+  }
+}
+
+function extractText(msg) {
+  return (msg.message.conversation ||
+    (msg.message.extendedTextMessage && msg.message.extendedTextMessage.text) || '');
+}
 
 async function startSock() {
   const { state, saveCreds } = await useMultiFileAuthState('./auth');
@@ -78,6 +99,13 @@ async function startSock() {
   });
 
   sock.ev.on('creds.update', saveCreds);
+
+  async function botSend(sender, content, quoted) {
+    pendingBotSend[sender] = Date.now();
+    const sent = await sock.sendMessage(sender, content, quoted ? { quoted } : undefined);
+    trackBotMsg(sent);
+    return sent;
+  }
 
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
@@ -98,7 +126,7 @@ async function startSock() {
         console.log('🔄 Connection tooti, dobara jorh raha hoon...');
         startSock();
       } else {
-        console.log('❌ Logged out. Termux band karke dobara node index.js chalayein.');
+        console.log('❌ Logged out. Termux dobara khol kar node index.js chalayein.');
       }
     } else if (connection === 'open') {
       console.log('✅ Jarvis is Online!');
@@ -108,12 +136,63 @@ async function startSock() {
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return;
     const msg = messages[0];
-    if (!msg.message || msg.key.fromMe) return;
+    if (!msg.message) return;
     const sender = msg.key.remoteJid;
     if (sender === 'status@broadcast') return;
 
-    const userText = msg.message.conversation || (msg.message.extendedTextMessage && msg.message.extendedTextMessage.text) || '';
+    const text = extractText(msg);
+
+    // ================= MALIK KI APNI MESSAGES =================
+    if (msg.key.fromMe) {
+      // Purani (history) wali messages ignore — sirf fresh dekho
+      const msgTime = (msg.messageTimestamp || (Date.now() / 1000)) * 1000;
+      if (Date.now() - msgTime > 2 * 60 * 1000) return;
+      if (!text.trim()) return;
+
+      const cmd = text.trim().toLowerCase();
+
+      // Commands — sirf malik hi bhej sakta hai
+      if (cmd === '.stop' || cmd === 'jarvis band') {
+        botPaused = true;
+        console.log('✋ Malik ne bot PAUSE kar diya');
+        await botSend(sender, { text: '✋ Jarvis pause ho gaya. Wapas on karne ke liye .start bhejein.' });
+        return;
+      }
+      if (cmd === '.start' || cmd === 'jarvis on') {
+        botPaused = false;
+        console.log('✅ Malik ne bot wapas ON kar diya');
+        await botSend(sender, { text: '✅ Jarvis wapas online ho gaya! Ab main reply karunga.' });
+        return;
+      }
+
+      // Ye bot ki khud ki bheji message thi? Ignore karo
+      if (botSentIds.has(msg.key.id)) return;
+      // Bot ne abhi-abhi send kiya tha? (echo race se bachao)
+      if (pendingBotSend[sender] && Date.now() - pendingBotSend[sender] < 5000) return;
+
+      // Malik ne KHUD type kar ke bheja → is chat mein bot chup ho jayega
+      chatSilence[sender] = Date.now();
+      console.log(`👤 Malik khud reply kar rahe hain — bot is chat mein ${SILENCE_MINUTES} min chup rahega (${sender})`);
+      return;
+    }
+
+    // ================= DUSRON KI MESSAGES =================
+    const userText = text;
     if (!userText || userText.length > 1000) return;
+
+    if (botPaused) {
+      console.log(`🤫 Bot pause hai — ${sender} ka message skip`);
+      return;
+    }
+
+    // Malik khud is chat mein baat kar rahe hon to bot chup rahe
+    if (chatSilence[sender]) {
+      if (Date.now() - chatSilence[sender] < SILENCE_MINUTES * 60 * 1000) {
+        console.log(`🤫 Malik is chat mein khud baat kar rahe hain — bot chup (${sender})`);
+        return;
+      }
+      delete chatSilence[sender]; // waqt khatam — bot wapas
+    }
 
     if (!chatHistory[sender]) {
       chatHistory[sender] = [
@@ -163,13 +242,13 @@ async function startSock() {
     try {
       const aiReply = await getAIReply(messagesToSend);
       chatHistory[sender].push({ role: "assistant", content: aiReply });
-      await sock.sendMessage(sender, { text: aiReply }, { quoted: msg });
+      await botSend(sender, { text: aiReply }, msg);
       console.log(`Replied: ${aiReply}`);
     } catch (error) {
       chatHistory[sender].pop();
       console.error('=== ERROR DETAILS ===');
       console.error(error.message);
-      await sock.sendMessage(sender, { text: 'Boss, abhi AI ke saare free servers busy hain. 1 minute baad dobara bhejein.' }, { quoted: msg });
+      await botSend(sender, { text: 'Boss, abhi AI ke saare free servers busy hain. 1 minute baad dobara bhejein.' }, msg);
     }
   });
 }
