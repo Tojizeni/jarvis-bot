@@ -1,0 +1,14 @@
+{
+  "name": "jarvis-bot",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.9",
+    "express": "^4.19.2",
+    "openai": "^4.77.0",
+    "pino": "^8.21.0"
+  }
+}
