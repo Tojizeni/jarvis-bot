@@ -48,23 +48,68 @@ function getRoutineNow() {
 }
 
 async function getAIReply(messages) {
-  let lastError;
-  for (const model of MODELS) {
-    try {
-      const response = await ai.chat.completions.create({ model, messages });
-      let reply = response.choices[0].message.content || "";
-      reply = reply.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+  // Baray (accurate) models pehle — agar last baar koi bara model chala hai to wo sab se pehle
+  const bigModels = MODELS.slice(0, 3);
+  const ordered = (lastGoodModel && bigModels.includes(lastGoodModel))
+    ? [lastGoodModel, ...MODELS.filter(m => m !== lastGoodModel)]
+    : [...MODELS];
+
+  return new Promise((resolve, reject) => {
+    let next = 0, settled = false, failures = 0;
+    const controllers = [];
+    let timer = null;
+
+    const cleanup = () => { clearInterval(timer); controllers.forEach(c => { try { c.abort(); } catch (e) {} }); };
+
+    const finish = (model, reply) => {
+      if (settled) return;
+      settled = true;
+      lastGoodModel = model;
+      cleanup();
       console.log(`✅ Jawab mila is model se: ${model}`);
-      return reply;
-    } catch (error) {
-      console.log(`⚠️ ${model} busy hai, agla try kar raha hoon...`);
-      lastError = error;
-      await new Promise(r => setTimeout(r, 2000));
-    }
-  }
-  throw lastError;
+      resolve(reply);
+    };
+
+    const launchNext = () => {
+      if (settled || next >= ordered.length) return;
+      const model = ordered[next++];
+      const c = new AbortController();
+      controllers.push(c);
+      ai.chat.completions.create(
+        { model, messages, max_tokens: 600 },
+        { signal: c.signal }
+      ).then(res => {
+        let reply = (res.choices[0] && res.choices[0].message.content) || "";
+        reply = reply.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+        if (!reply) throw new Error("khaali jawab");
+        finish(model, reply);
+      }).catch(err => {
+        if (settled) return;
+        failures++;
+        console.log(`⚠️ ${model} fail — agla model foran chala raha hoon`);
+        if (failures >= ordered.length) {
+          settled = true;
+          clearInterval(timer);
+          reject(err);
+        } else {
+          launchNext();   // koi wait nahi — turant agla!
+        }
+      });
+    };
+
+    // Pehla model foran chalao
+    launchNext();
+
+    // Agar 4 second tak koi jawab na aaye to sath mein agla bhi (race)
+    timer = setInterval(() => {
+      if (settled || next >= ordered.length) { clearInterval(timer); return; }
+      console.log(`⏱️ 4 sec ho gaye — agla model bhi race mein daal raha hoon`);
+      launchNext();
+    }, 4000);
+  });
 }
 
+let lastGoodModel = null;   // jo bara model last baar chala ho, wo pehle try hoga
 const chatHistory = {};
 const chatSilence = {};      // jis chat mein malik khud baat kar raha ho
 const pendingBotSend = {};   // bot ne kab send kiya (echo se bachne ke liye)
