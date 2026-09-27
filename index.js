@@ -8,6 +8,7 @@ const BOT_PHONE = "923479858077";
 const BOT_JID = BOT_PHONE + "@s.whatsapp.net";
 const SILENCE_MINUTES = 5;
 const REPLY_TIMEOUT_MS = 45000;
+const MISSED_MSG_WINDOW = 5 * 60 * 1000; // offline aayi messages itni hi purani tak process hongi
 
 const ai = new OpenAI({
   apiKey: process.env.OPENROUTER_API_KEY,
@@ -25,15 +26,15 @@ const MODELS = [
 
 // Keep-alive server
 const app = express();
-app.get('/', (req, res) => res.send('JARVIS v2.2 online! ✅'));
+app.get('/', (req, res) => res.send('JARVIS v2.3 online! ✅'));
 app.listen(process.env.PORT || 3000, () => console.log('Keep-alive server chal raha hai'));
 
 // ==================== STATE ====================
 let lastGoodModel = null;
 let botPaused = false;
 let pairingShown = false;
-let reconnectDelay = 5000;     // shuru 5 sec — har fail par barhta hai
-let reconnectTimer = null;     // double-reconnect se bachao
+let reconnectDelay = 5000;
+let reconnectTimer = null;
 const chatHistory = {};
 const chatSilence = {};
 const chatMuted = {};
@@ -248,26 +249,27 @@ async function startSock() {
         console.log('⚠️ CONFLICT! Lagta hai doosra bot bhi chal raha hai — sirf EK chalao!');
       }
 
-      // Double reconnect se bachao
       if (reconnectTimer) return;
 
       const waitSec = Math.round(reconnectDelay / 1000);
       console.log(`🔄 Connection tooti — ${waitSec} sec baad dobara jorunga...`);
       reconnectTimer = setTimeout(() => {
         reconnectTimer = null;
-        reconnectDelay = Math.min(Math.round(reconnectDelay * 1.5), 60000); // har fail par barhta hai, max 1 min
+        reconnectDelay = Math.min(Math.round(reconnectDelay * 1.5), 60000);
         startSock();
       }, reconnectDelay);
 
     } else if (connection === 'open') {
-      reconnectDelay = 5000; // connection pakki ho gayi — delay reset
-      console.log('✅ JARVIS v2.2 is Online!');
+      reconnectDelay = 5000;
+      console.log('✅ JARVIS v2.3 is Online!');
     }
   });
 
   // ===== Message handler =====
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify') return;
+    // 'notify' = live message | 'append' = bot band tha to pending/offline message
+    if (type !== 'notify' && type !== 'append') return;
+
     const msg = messages[0];
     if (!msg.message) return;
     const sender = msg.key.remoteJid;
@@ -275,6 +277,19 @@ async function startSock() {
 
     if (seenIds.has(msg.key.id)) return;
     markSeen(msg.key.id);
+
+    // ⭐ FIX: offline aayi (append) messages sirf 5 min se purani tak process karo
+    if (type === 'append') {
+      const t = (msg.messageTimestamp || (Date.now() / 1000)) * 1000;
+      if (Date.now() - t > MISSED_MSG_WINDOW) return;
+      console.log(`📥 Offline message mila (missed tha) — process kar raha hoon`);
+    }
+
+    // ⭐ Guard: connection abhi pura khula nahi to thora ruk jao
+    if (!sock.user) {
+      await new Promise(r => setTimeout(r, 3000));
+      if (!sock.user) return;
+    }
 
     const text = extractText(msg);
 
@@ -298,7 +313,7 @@ async function startSock() {
       if (cmd === '.status') {
         const up = Math.floor((Date.now() - stats.started) / 60000);
         await botSend(sender, { text:
-`📊 JARVIS v2.2 Status
+`📊 JARVIS v2.3 Status
 ⏱️ Uptime: ${Math.floor(up/60)}h ${up%60}m
 📨 Served: ${stats.served} | 💬 Replies: ${stats.replies} | ⚠️ Errors: ${stats.errors}
 🧠 Model: ${lastGoodModel || 'n/a'}
@@ -311,7 +326,6 @@ async function startSock() {
         return;
       }
 
-      // --- .mute / .unmute ---
       if (cmd.startsWith('.mute')) {
         const mins = parseInt(cmd.split(' ')[1]);
         chatMuted[sender] = (isNaN(mins)) ? Infinity : Date.now() + mins * 60000;
@@ -328,11 +342,9 @@ async function startSock() {
         return;
       }
 
-      // Bot ki khud ki message? Ignore
       if (botSentIds.has(msg.key.id)) return;
       if (pendingBotSend[sender] && Date.now() - pendingBotSend[sender] < 5000) return;
 
-      // Malik ne khud type kar ke bheja → DM mein bot 5 min chup
       if (!isGroup(sender)) {
         chatSilence[sender] = Date.now();
         console.log(`👤 Malik khud baat kar rahe hain — bot is chat mein ${SILENCE_MINUTES} min chup`);
@@ -371,7 +383,7 @@ async function startSock() {
     }
     if (cmd === '.help' || cmd === 'help') {
       await botSend(sender, { text:
-`🤖 *JARVIS v2.2* — at your service
+`🤖 *JARVIS v2.3* — at your service
 
 Main ek AI assistant hoon — kuch bhi pooch lo: general knowledge, coding, translation, ideas, ya malik ke bare mein.
 
