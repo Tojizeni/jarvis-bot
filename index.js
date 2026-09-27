@@ -16,10 +16,11 @@ const ai = new OpenAI({
 });
 
 const MODELS = [
-  "z-ai/glm-5.2:free",
+  "nvidia/nemotron-3-ultra-550b-a55b:free",
+  "nvidia/nemotron-3-super-120b-a12b:free",
   "google/gemma-4-31b-it:free",
   "qwen/qwen3.8-27b:free",
-  "google/gemma-4-26b-a4b-it:free",
+  "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
   "nvidia/nemotron-3.5-lightning:free",
   "inclusionai/ling-3.0-flash-sante:free",
 ];
