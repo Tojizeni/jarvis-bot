@@ -8,7 +8,7 @@ const BOT_PHONE = "923479858077";
 const BOT_JID = BOT_PHONE + "@s.whatsapp.net";
 const SILENCE_MINUTES = 5;
 const REPLY_TIMEOUT_MS = 45000;
-const MISSED_MSG_WINDOW = 5 * 60 * 1000; // offline aayi messages itni hi purani tak process hongi
+const MISSED_MSG_WINDOW = 10 * 60 * 1000; // offline messages: 10 min tak purani process hongi
 
 const ai = new OpenAI({
   apiKey: process.env.OPENROUTER_API_KEY,
@@ -26,7 +26,7 @@ const MODELS = [
 
 // Keep-alive server
 const app = express();
-app.get('/', (req, res) => res.send('JARVIS v2.3 online! ✅'));
+app.get('/', (req, res) => res.send('JARVIS v2.4 online! ✅'));
 app.listen(process.env.PORT || 3000, () => console.log('Keep-alive server chal raha hai'));
 
 // ==================== STATE ====================
@@ -70,11 +70,6 @@ function getRoutineNow() {
 function extractText(msg) {
   return (msg.message.conversation ||
     (msg.message.extendedTextMessage && msg.message.extendedTextMessage.text) || '');
-}
-
-function isFresh(msg) {
-  const t = (msg.messageTimestamp || (Date.now() / 1000)) * 1000;
-  return Date.now() - t < 2 * 60 * 1000;
 }
 
 function isGroup(sender) { return sender.endsWith('@g.us'); }
@@ -261,41 +256,54 @@ async function startSock() {
 
     } else if (connection === 'open') {
       reconnectDelay = 5000;
-      console.log('✅ JARVIS v2.3 is Online!');
+      console.log('✅ JARVIS v2.4 is Online!');
     }
   });
 
-  // ===== Message handler =====
+  // ===== Message handler — ⭐ AB POORI BATCH PROCESS HOTI HAI =====
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    // 'notify' = live message | 'append' = bot band tha to pending/offline message
     if (type !== 'notify' && type !== 'append') return;
+    if (messages.length > 1) console.log(`📦 ${messages.length} messages ek sath aayin — SAB process karunga`);
+    for (const msg of messages) {
+      try { await processMessage(msg, type); }
+      catch (e) { console.error('Msg process error:', e && e.message); }
+    }
+  });
 
-    const msg = messages[0];
+  // ===== Ek message ki poori processing =====
+  async function processMessage(msg, type) {
     if (!msg.message) return;
     const sender = msg.key.remoteJid;
-    if (sender === 'status@broadcast') return;
+    if (!sender || sender === 'status@broadcast') return;
 
     if (seenIds.has(msg.key.id)) return;
     markSeen(msg.key.id);
 
-    // ⭐ FIX: offline aayi (append) messages sirf 5 min se purani tak process karo
+    const msgTime = (msg.messageTimestamp || (Date.now() / 1000)) * 1000;
+
+    // ⭐ append = bot offline tha tab aayi message
     if (type === 'append') {
-      const t = (msg.messageTimestamp || (Date.now() / 1000)) * 1000;
-      if (Date.now() - t > MISSED_MSG_WINDOW) return;
-      console.log(`📥 Offline message mila (missed tha) — process kar raha hoon`);
+      const ageSec = Math.round((Date.now() - msgTime) / 1000);
+      if (Date.now() - msgTime > MISSED_MSG_WINDOW) {
+        console.log(`📵 Offline message ${ageSec} sec purani thi — skip (limit 10 min)`);
+        return;
+      }
+      console.log(`📥 Offline message mili (${ageSec} sec purani) — process kar raha hoon`);
     }
 
     // ⭐ Guard: connection abhi pura khula nahi to thora ruk jao
     if (!sock.user) {
       await new Promise(r => setTimeout(r, 3000));
-      if (!sock.user) return;
+      if (!sock.user) { console.log('⏳ Connection abhi khula nahi — ye message chhora'); return; }
     }
 
     const text = extractText(msg);
 
     // ========== MALIK KI APNI MESSAGES ==========
     if (msg.key.fromMe) {
-      if (!isFresh(msg) || !text.trim()) return;
+      // Live: 2 min | Offline (append): 10 min tak — taake net-drop ke doran ki manual replies bhi silence kar sakein
+      const maxAge = (type === 'append') ? MISSED_MSG_WINDOW : 2 * 60 * 1000;
+      if (Date.now() - msgTime > maxAge || !text.trim()) return;
       const cmd = text.trim().toLowerCase();
 
       if (cmd === '.stop' || cmd === 'jarvis band') {
@@ -313,7 +321,7 @@ async function startSock() {
       if (cmd === '.status') {
         const up = Math.floor((Date.now() - stats.started) / 60000);
         await botSend(sender, { text:
-`📊 JARVIS v2.3 Status
+`📊 JARVIS v2.4 Status
 ⏱️ Uptime: ${Math.floor(up/60)}h ${up%60}m
 📨 Served: ${stats.served} | 💬 Replies: ${stats.replies} | ⚠️ Errors: ${stats.errors}
 🧠 Model: ${lastGoodModel || 'n/a'}
@@ -383,7 +391,7 @@ async function startSock() {
     }
     if (cmd === '.help' || cmd === 'help') {
       await botSend(sender, { text:
-`🤖 *JARVIS v2.3* — at your service
+`🤖 *JARVIS v2.4* — at your service
 
 Main ek AI assistant hoon — kuch bhi pooch lo: general knowledge, coding, translation, ideas, ya malik ke bare mein.
 
@@ -400,7 +408,7 @@ Main ek AI assistant hoon — kuch bhi pooch lo: general knowledge, coding, tran
     stats.served++;
     console.log(`Message from ${sender}: ${text}`);
     enqueue(sender, () => handleMessage(sock, sender, msg, text));
-  });
+  }
 
   // ===== Per-message processing =====
   async function handleMessage(sock, sender, msg, userText) {
