@@ -6,8 +6,8 @@ const { OpenAI } = require('openai');
 // ==================== CONFIG ====================
 const BOT_PHONE = "923479858077";
 const BOT_JID = BOT_PHONE + "@s.whatsapp.net";
-const SILENCE_MINUTES = 5;        // malik khud reply kare to bot itni der chup
-const REPLY_TIMEOUT_MS = 45000;   // AI ka max wait
+const SILENCE_MINUTES = 5;
+const REPLY_TIMEOUT_MS = 45000;
 
 const ai = new OpenAI({
   apiKey: process.env.OPENROUTER_API_KEY,
@@ -25,16 +25,18 @@ const MODELS = [
 
 // Keep-alive server
 const app = express();
-app.get('/', (req, res) => res.send('JARVIS v2.1 online! ✅'));
+app.get('/', (req, res) => res.send('JARVIS v2.2 online! ✅'));
 app.listen(process.env.PORT || 3000, () => console.log('Keep-alive server chal raha hai'));
 
 // ==================== STATE ====================
 let lastGoodModel = null;
 let botPaused = false;
 let pairingShown = false;
+let reconnectDelay = 5000;     // shuru 5 sec — har fail par barhta hai
+let reconnectTimer = null;     // double-reconnect se bachao
 const chatHistory = {};
-const chatSilence = {};      // malik khud baat kar raha ho (5 min)
-const chatMuted = {};        // .mute wali chats
+const chatSilence = {};
+const chatMuted = {};
 const pendingBotSend = {};
 const botSentIds = new Set();
 const seenIds = new Set();
@@ -205,7 +207,11 @@ async function startSock() {
     auth: state,
     printQRInTerminal: false,
     browser: ['Ubuntu', 'Chrome', '22.04'],
-    logger: pino({ level: 'silent' })
+    logger: pino({ level: 'silent' }),
+    connectTimeoutMs: 20000,
+    keepAliveIntervalMs: 30000,
+    retryRequestDelayMs: 2000,
+    markOnlineOnConnect: false
   });
 
   sock.ev.on('creds.update', saveCreds);
@@ -232,14 +238,30 @@ async function startSock() {
 
     if (connection === 'close') {
       const statusCode = lastDisconnect?.error?.output?.statusCode;
-      if (statusCode !== DisconnectReason.loggedOut) {
-        console.log('🔄 Connection tooti, dobara jorh raha hoon...');
-        startSock();
-      } else {
-        console.log('❌ Logged out. Termux mein node index.js dobara chalayein.');
+
+      if (statusCode === DisconnectReason.loggedOut) {
+        console.log('❌ Logged out — Termux mein node index.js dobara chalayein (pairing code aayega).');
+        return;
       }
+
+      if (statusCode === 440) {
+        console.log('⚠️ CONFLICT! Lagta hai doosra bot bhi chal raha hai — sirf EK chalao!');
+      }
+
+      // Double reconnect se bachao
+      if (reconnectTimer) return;
+
+      const waitSec = Math.round(reconnectDelay / 1000);
+      console.log(`🔄 Connection tooti — ${waitSec} sec baad dobara jorunga...`);
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        reconnectDelay = Math.min(Math.round(reconnectDelay * 1.5), 60000); // har fail par barhta hai, max 1 min
+        startSock();
+      }, reconnectDelay);
+
     } else if (connection === 'open') {
-      console.log('✅ JARVIS v2.1 is Online!');
+      reconnectDelay = 5000; // connection pakki ho gayi — delay reset
+      console.log('✅ JARVIS v2.2 is Online!');
     }
   });
 
@@ -261,7 +283,6 @@ async function startSock() {
       if (!isFresh(msg) || !text.trim()) return;
       const cmd = text.trim().toLowerCase();
 
-      // --- Global owner commands ---
       if (cmd === '.stop' || cmd === 'jarvis band') {
         botPaused = true;
         console.log('✋ Bot PAUSED');
@@ -277,7 +298,7 @@ async function startSock() {
       if (cmd === '.status') {
         const up = Math.floor((Date.now() - stats.started) / 60000);
         await botSend(sender, { text:
-`📊 JARVIS v2.1 Status
+`📊 JARVIS v2.2 Status
 ⏱️ Uptime: ${Math.floor(up/60)}h ${up%60}m
 📨 Served: ${stats.served} | 💬 Replies: ${stats.replies} | ⚠️ Errors: ${stats.errors}
 🧠 Model: ${lastGoodModel || 'n/a'}
@@ -290,7 +311,7 @@ async function startSock() {
         return;
       }
 
-      // --- .mute / .unmute (chat-specific) ---
+      // --- .mute / .unmute ---
       if (cmd.startsWith('.mute')) {
         const mins = parseInt(cmd.split(' ')[1]);
         chatMuted[sender] = (isNaN(mins)) ? Infinity : Date.now() + mins * 60000;
@@ -324,7 +345,6 @@ async function startSock() {
 
     if (botPaused) { console.log(`🤫 Paused — ${sender} skip`); return; }
 
-    // .mute wali chat? (bot khud check karta rahega, waqt khatam to wapas)
     if (chatMuted[sender]) {
       if (chatMuted[sender] === Infinity || Date.now() < chatMuted[sender]) {
         console.log(`🔇 Muted chat — skip (${sender})`);
@@ -333,7 +353,6 @@ async function startSock() {
       delete chatMuted[sender];
     }
 
-    // Malik khud is chat mein baat kar rahe hon
     if (!isGroup(sender) && chatSilence[sender]) {
       if (Date.now() - chatSilence[sender] < SILENCE_MINUTES * 60 * 1000) {
         console.log(`🤫 Malik is chat mein khud baat kar rahe hain — skip (${sender})`);
@@ -342,10 +361,8 @@ async function startSock() {
       delete chatSilence[sender];
     }
 
-    // Group mein sirf mention/reply par bolna
     if (isGroup(sender) && !botMentioned(msg)) return;
 
-    // Quick commands (sab ke liye, instant)
     const cmd = text.trim().toLowerCase();
     if (cmd === '.time' || cmd === 'time?' || cmd === 'waqt') {
       const now = new Date();
@@ -354,7 +371,7 @@ async function startSock() {
     }
     if (cmd === '.help' || cmd === 'help') {
       await botSend(sender, { text:
-`🤖 *JARVIS v2.1* — at your service
+`🤖 *JARVIS v2.2* — at your service
 
 Main ek AI assistant hoon — kuch bhi pooch lo: general knowledge, coding, translation, ideas, ya malik ke bare mein.
 
@@ -368,7 +385,6 @@ Main ek AI assistant hoon — kuch bhi pooch lo: general knowledge, coding, tran
       return;
     }
 
-    // Queue — har chat ki apni line, chats aapas mein parallel
     stats.served++;
     console.log(`Message from ${sender}: ${text}`);
     enqueue(sender, () => handleMessage(sock, sender, msg, text));
