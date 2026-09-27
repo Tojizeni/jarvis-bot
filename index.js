@@ -6,8 +6,8 @@ const { OpenAI } = require('openai');
 // ==================== CONFIG ====================
 const BOT_PHONE = "923479858077";
 const BOT_JID = BOT_PHONE + "@s.whatsapp.net";
-const SILENCE_MINUTES = 5;        // malik khud baat kare to bot kitni der chup
-const REPLY_TIMEOUT_MS = 45000;   // AI se itni der ke baad fallback
+const SILENCE_MINUTES = 5;        // malik khud reply kare to bot itni der chup
+const REPLY_TIMEOUT_MS = 45000;   // AI ka max wait
 
 const ai = new OpenAI({
   apiKey: process.env.OPENROUTER_API_KEY,
@@ -25,7 +25,7 @@ const MODELS = [
 
 // Keep-alive server
 const app = express();
-app.get('/', (req, res) => res.send('JARVIS v2 online! ✅'));
+app.get('/', (req, res) => res.send('JARVIS v2.1 online! ✅'));
 app.listen(process.env.PORT || 3000, () => console.log('Keep-alive server chal raha hai'));
 
 // ==================== STATE ====================
@@ -33,7 +33,8 @@ let lastGoodModel = null;
 let botPaused = false;
 let pairingShown = false;
 const chatHistory = {};
-const chatSilence = {};
+const chatSilence = {};      // malik khud baat kar raha ho (5 min)
+const chatMuted = {};        // .mute wali chats
 const pendingBotSend = {};
 const botSentIds = new Set();
 const seenIds = new Set();
@@ -79,7 +80,7 @@ function botMentioned(msg) {
   const ctx = msg.message.extendedTextMessage && msg.message.extendedTextMessage.contextInfo;
   if (!ctx) return false;
   if (ctx.mentionedJid && ctx.mentionedJid.includes(BOT_JID)) return true;
-  if (ctx.participant === BOT_JID) return true; // bot ki message ka reply
+  if (ctx.participant === BOT_JID) return true;
   return false;
 }
 
@@ -95,7 +96,6 @@ function markSeen(id) {
   if (seenIds.size > 2000) seenIds.delete(seenIds.values().next().value);
 }
 
-// Har chat ki apni queue — ek chat ke messages serial, alag chats parallel
 function enqueue(sender, task) {
   if (!chatQueues[sender]) chatQueues[sender] = { chain: Promise.resolve(), count: 0 };
   const q = chatQueues[sender];
@@ -239,8 +239,7 @@ async function startSock() {
         console.log('❌ Logged out. Termux mein node index.js dobara chalayein.');
       }
     } else if (connection === 'open') {
-      console.log('✅ JARVIS v2 is Online!');
-      console.log(`⏱️ Uptime ke baad .status se dekh sakte hain`);
+      console.log('✅ JARVIS v2.1 is Online!');
     }
   });
 
@@ -252,7 +251,6 @@ async function startSock() {
     const sender = msg.key.remoteJid;
     if (sender === 'status@broadcast') return;
 
-    // Dedup — ek message do dafa process nahi hoga
     if (seenIds.has(msg.key.id)) return;
     markSeen(msg.key.id);
 
@@ -263,7 +261,7 @@ async function startSock() {
       if (!isFresh(msg) || !text.trim()) return;
       const cmd = text.trim().toLowerCase();
 
-      // --- Owner commands (har jagah kaam karte hain) ---
+      // --- Global owner commands ---
       if (cmd === '.stop' || cmd === 'jarvis band') {
         botPaused = true;
         console.log('✋ Bot PAUSED');
@@ -279,18 +277,33 @@ async function startSock() {
       if (cmd === '.status') {
         const up = Math.floor((Date.now() - stats.started) / 60000);
         await botSend(sender, { text:
-`📊 JARVIS v2 Status
+`📊 JARVIS v2.1 Status
 ⏱️ Uptime: ${Math.floor(up/60)}h ${up%60}m
-📨 Messages served: ${stats.served}
-💬 Replies: ${stats.replies}
-⚠️ Errors: ${stats.errors}
-🧠 Last model: ${lastGoodModel || 'n/a'}
+📨 Served: ${stats.served} | 💬 Replies: ${stats.replies} | ⚠️ Errors: ${stats.errors}
+🧠 Model: ${lastGoodModel || 'n/a'}
  ${botPaused ? '🔴 Paused (.start se on karein)' : '🟢 Active'}` });
         return;
       }
       if (cmd === '.reset') {
         delete chatHistory[sender];
         await botSend(sender, { text: '🧹 Is chat ki memory reset ho gayi.' });
+        return;
+      }
+
+      // --- .mute / .unmute (chat-specific) ---
+      if (cmd.startsWith('.mute')) {
+        const mins = parseInt(cmd.split(' ')[1]);
+        chatMuted[sender] = (isNaN(mins)) ? Infinity : Date.now() + mins * 60000;
+        delete chatSilence[sender];
+        await botSend(sender, { text: isNaN(mins)
+          ? '🔇 JARVIS is chat mein chup ho gaya. Wapas: .unmute'
+          : `🔇 JARVIS ${mins} minute ke liye is chat mein chup hai.` });
+        return;
+      }
+      if (cmd === '.unmute') {
+        delete chatMuted[sender];
+        delete chatSilence[sender];
+        await botSend(sender, { text: '🔊 JARVIS is chat mein wapas active hai.' });
         return;
       }
 
@@ -311,6 +324,15 @@ async function startSock() {
 
     if (botPaused) { console.log(`🤫 Paused — ${sender} skip`); return; }
 
+    // .mute wali chat? (bot khud check karta rahega, waqt khatam to wapas)
+    if (chatMuted[sender]) {
+      if (chatMuted[sender] === Infinity || Date.now() < chatMuted[sender]) {
+        console.log(`🔇 Muted chat — skip (${sender})`);
+        return;
+      }
+      delete chatMuted[sender];
+    }
+
     // Malik khud is chat mein baat kar rahe hon
     if (!isGroup(sender) && chatSilence[sender]) {
       if (Date.now() - chatSilence[sender] < SILENCE_MINUTES * 60 * 1000) {
@@ -323,7 +345,7 @@ async function startSock() {
     // Group mein sirf mention/reply par bolna
     if (isGroup(sender) && !botMentioned(msg)) return;
 
-    // Quick commands — instant, AI ki zaroorat nahi
+    // Quick commands (sab ke liye, instant)
     const cmd = text.trim().toLowerCase();
     if (cmd === '.time' || cmd === 'time?' || cmd === 'waqt') {
       const now = new Date();
@@ -332,7 +354,7 @@ async function startSock() {
     }
     if (cmd === '.help' || cmd === 'help') {
       await botSend(sender, { text:
-`🤖 *JARVIS v2* — at your service
+`🤖 *JARVIS v2.1* — at your service
 
 Main ek AI assistant hoon — kuch bhi pooch lo: general knowledge, coding, translation, ideas, ya malik ke bare mein.
 
@@ -340,13 +362,13 @@ Main ek AI assistant hoon — kuch bhi pooch lo: general knowledge, coding, tran
 • .time — exact waqt
 • .help — ye list
 
-👥 Group mein mujhe mention karna ya mere message ka reply karna zaroori hai.
+👥 Group mein mujhe mention ya reply karna zaroori hai.
 
-💡 Owner ke commands: .stop / .start / .status / .reset` }, msg);
+💡 Owner: .stop / .start / .status / .reset / .mute / .unmute` }, msg);
       return;
     }
 
-    // Queue mein daalo — har chat ki apni line, chats aapas mein parallel
+    // Queue — har chat ki apni line, chats aapas mein parallel
     stats.served++;
     console.log(`Message from ${sender}: ${text}`);
     enqueue(sender, () => handleMessage(sock, sender, msg, text));
@@ -354,7 +376,6 @@ Main ek AI assistant hoon — kuch bhi pooch lo: general knowledge, coding, tran
 
   // ===== Per-message processing =====
   async function handleMessage(sock, sender, msg, userText) {
-    // Blue tick + typing indicator
     await safe(() => sock.readMessages([msg.key]));
     await safe(() => sock.sendPresenceUpdate('composing', sender));
 
