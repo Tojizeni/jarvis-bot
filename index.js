@@ -1,7 +1,11 @@
-// ===== JARVIS v3.0 — FINAL =====
-// Groq (primary) + Gemini + OpenRouter | Persistent dedup | Contact memory
-// Silence system | Mute/Unmute | Self-chat notifications | Noise filter
+// ================================================================
+// JARVIS v3.1 — FINAL COMPLETE BUILD
+// Fixes included: lid-numbers | self-chat guards | persistent dedup
+// Mute/Unmute | Contact memory | 3 AI providers (Groq+Gemini+OR)
+// Decrypt-fail counter | Noise filter | Racing models | Quota guard
+// ================================================================
 
+// ===== NOISE FILTER =====
 const NOISE_PATTERNS = [
   'Closing session',
   'Removing old closed session',
@@ -43,7 +47,7 @@ console.error = function (...args) {
   origErr.apply(console, args);
 };
 
-console.log('🤖 JARVIS v3.0 start ho raha hai... (Groq + Gemini + OpenRouter)');
+console.log('🤖 JARVIS v3.1 FINAL start ho raha hai...');
 
 const express = require('express');
 const pino = require('pino');
@@ -61,7 +65,7 @@ const REPLY_TIMEOUT_MS = 45000;
 const MISSED_MSG_WINDOW = 10 * 60 * 1000;
 const MAX_ASKS = 3;
 
-// ==================== AI PROVIDERS (3 wale — lazy) ====================
+// ==================== AI PROVIDERS (3 wale) ====================
 function makeClient(keyEnv, baseURL) {
   const key = (process.env[keyEnv] || '').trim();
   if (!key) {
@@ -103,7 +107,7 @@ function buildTargets() {
   return t;
 }
 
-// Quota guard — limit khatam provider ko park kar do
+// Quota guard
 const providerBlockedUntil = { groq: 0, openrouter: 0, google: 0 };
 
 function noteProviderError(provider, err) {
@@ -134,7 +138,7 @@ function providerStatus() {
 
 // Keep-alive server
 const app = express();
-app.get('/', (req, res) => res.send('JARVIS v3.0 online! ✅'));
+app.get('/', (req, res) => res.send('JARVIS v3.1 online! ✅'));
 app.listen(process.env.PORT || 3000, () => console.log('Keep-alive server chal raha hai'));
 
 // ==================== CONTACT MEMORY ====================
@@ -211,6 +215,7 @@ let botPaused = false;
 let pairingShown = false;
 let reconnectDelay = 5000;
 let reconnectTimer = null;
+let decryptFails = 0;
 const chatHistory = {};
 const chatSilence = {};
 const chatMuted = {};
@@ -343,7 +348,7 @@ function systemPromptFor(sender, contact) {
 - Never invent facts about Huzaifa Sahab.${groupNote}`;
 }
 
-// ==================== AI (Racing, 3 providers, quota-aware) ====================
+// ==================== AI (Racing, 3 providers) ====================
 async function getAIReply(messages) {
   const all = buildTargets().filter(t => Date.now() >= providerBlockedUntil[t.provider]);
   if (all.length === 0) throw new Error('AI_LIMIT');
@@ -373,7 +378,7 @@ async function getAIReply(messages) {
       const c = new AbortController();
       controllers.push(c);
 
-      // Groq ke gpt-oss models sochne mein tokens kharch karte hain — control karo
+      // Groq gpt-oss models reasoning tokens kharch karte hain — control
       const params = { model: target.model, messages, max_tokens: 800 };
       if (target.provider === 'groq') {
         params.reasoning_effort = 'low';
@@ -453,29 +458,35 @@ async function startSock() {
 
   const safe = async (fn) => { try { await fn(); } catch (e) {} };
 
+  // ===== Self-chat notification — saaf numbers, naam ke sath =====
   async function notifyOwner(sender, bodyText) {
     try {
       if (sender === BOT_JID) return;
-      let fromLabel = sender.split('@')[0];
+      // @lid / @s.whatsapp.net hatao — saaf number dikhao
+      const rawNum = sender.split('@')[0];
+      let fromLabel = '+' + rawNum;
       let chatType = 'DM';
       if (isGroup(sender)) {
         chatType = 'Group';
         try {
-          const meta = await sock.groupMetadata(sender);
+          const meta = await Promise.race([
+            sock.groupMetadata(sender),
+            new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 3000))
+          ]);
           fromLabel = meta.subject || fromLabel;
         } catch (e) {}
       }
       const contact = lookupContact(sender);
-      if (contact && contact.name) fromLabel += ` (${contact.name})`;
+      const namePart = (contact && contact.name) ? ` (${contact.name})` : '';
       const timeStr = new Date().toLocaleTimeString('en-US', {hour:'2-digit', minute:'2-digit', hour12:true});
       await botSend(BOT_JID, { text:
 `📩 *Huzaifa Sahab, aapke liye message aaya hai*
 
-👤 From: ${fromLabel} (${chatType})
+👤 From: ${fromLabel}${namePart} (${chatType})
 🕐 Waqt: ${timeStr}
 
 💬 ${bodyText}` });
-      console.log(`📩 Self chat mein notify kiya (${fromLabel})`);
+      console.log(`📩 Self chat mein notify kiya (${fromLabel}${namePart})`);
     } catch (e) { console.log('Notify fail:', e && e.message); }
   }
 
@@ -515,7 +526,7 @@ async function startSock() {
     } else if (connection === 'open') {
       reconnectDelay = 5000;
       const ps = providerStatus();
-      console.log('✅ JARVIS v3.0 is Online!');
+      console.log('✅ JARVIS v3.1 is Online!');
       console.log(`🔌 Groq: ${ps.q} | Google AI: ${ps.g} | OpenRouter: ${ps.or}`);
     }
   });
@@ -530,7 +541,15 @@ async function startSock() {
   });
 
   async function processMessage(msg, type) {
-    if (!msg.message) return;
+    // ===== Decrypt-fail backlog counter (10 par 1 line) =====
+    if (!msg.message) {
+      decryptFails++;
+      if (decryptFails % 10 === 1) {
+        console.log(`ℹ️ ${decryptFails} decrypt-fail backlog msgs (WhatsApp purana session — khud khatam hoga)`);
+      }
+      return;
+    }
+
     const sender = msg.key.remoteJid;
     if (!sender || sender === 'status@broadcast') return;
 
@@ -566,6 +585,10 @@ async function startSock() {
       if (Date.now() - msgTime > maxAge || !text.trim()) return;
       const cmd = text.trim().toLowerCase();
 
+      // ⭐ Bot ki khud ki bheji message? (notifications / command replies) — SAB SE PEHLE ignore
+      if (botSentIds.has(msg.key.id)) return;
+      if (pendingBotSend[sender] && Date.now() - pendingBotSend[sender] < 5000) return;
+
       if (cmd === '.stop' || cmd === 'jarvis band') {
         botPaused = true;
         console.log('✋ Bot PAUSED');
@@ -582,7 +605,7 @@ async function startSock() {
         const up = Math.floor((Date.now() - stats.started) / 60000);
         const ps = providerStatus();
         await botSend(sender, { text:
-`📊 JARVIS v3.0 Status
+`📊 JARVIS v3.1 Status
 ⏱️ Uptime: ${Math.floor(up/60)}h ${up%60}m
 📨 Served: ${stats.served} | 💬 Replies: ${stats.replies} | ⚠️ Errors: ${stats.errors}
 🧠 Last model: ${lastGoodKey || 'n/a'}
@@ -614,7 +637,6 @@ async function startSock() {
           : '👤 Ye chat unknown hai — naam poochhunga jab baat hogi.' });
         return;
       }
-
       if (cmd.startsWith('.mute')) {
         const mins = parseInt(cmd.split(' ')[1]);
         chatMuted[sender] = (isNaN(mins)) ? Infinity : Date.now() + mins * 60000;
@@ -631,10 +653,8 @@ async function startSock() {
         return;
       }
 
-      if (botSentIds.has(msg.key.id)) return;
-      if (pendingBotSend[sender] && Date.now() - pendingBotSend[sender] < 5000) return;
-
-      if (!isGroup(sender)) {
+      // ⭐ Self-chat mein silence NA lagaao — wahan sirf notifications aati hain
+      if (!isGroup(sender) && sender !== BOT_JID) {
         chatSilence[sender] = Math.max(chatSilence[sender] || 0, msgTime);
         console.log(`👤 Huzaifa Sahab khud baat kar rahe hain — bot is chat mein 5 min chup (us waqt se)`);
       }
@@ -651,6 +671,7 @@ async function startSock() {
       return;
     }
 
+    // ⭐ Notification sirf LIVE messages ke liye (restart backlog spam nahi)
     if (type === 'notify' && !text.trim().startsWith('.') && (!isGroup(sender) || botMentioned(msg))) {
       await safe(() => notifyOwner(sender, text));
     }
@@ -683,7 +704,7 @@ async function startSock() {
     }
     if (cmd === '.help' || cmd === 'help') {
       await botSend(sender, { text:
-`🤖 *JARVIS v3.0* — at your service
+`🤖 *JARVIS v3.1* — at your service
 
 Main Huzaifa Sahab ka AI assistant hoon — kuch bhi pooch lo: general knowledge, coding, translation, ideas, ya unke bare mein.
 
