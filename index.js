@@ -1,20 +1,48 @@
-// ===== Terminal saaf rakho — WhatsApp encryption ka shor chhupao =====
-const origLog = console.log;
+// ===== v2.8: 100% NOISE BLOCK (stdout + stderr — har rasta band) =====
+const NOISE_PATTERNS = [
+  'Closing session',
+  'Removing old closed session',
+  'Closing open session',
+  'SessionEntry',
+  'Bad MAC',
+  'Decrypted message with closed session',
+  'Session error',
+];
+
+// Har output stream ko patch karo — chahe noise kahin se bhi aaye, pakda jayega
+function patchStream(stream) {
+  const orig = stream.write.bind(stream);
+  stream.write = function (chunk, enc, cb) {
+    try {
+      const s = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+      for (const p of NOISE_PATTERNS) {
+        if (s.includes(p)) {
+          if (typeof enc === 'function') enc();
+          else if (typeof cb === 'function') cb();
+          return true;
+        }
+      }
+    } catch (e) {}
+    return orig(chunk, enc, cb);
+  };
+}
+patchStream(process.stdout);
+patchStream(process.stderr);
+
+// console bhi wrap karo (double protection)
+const origLog = console.log, origErr = console.error;
 console.log = function (...args) {
-  try {
-    const first = String(args[0] || '');
-    const noise =
-      first.includes('Removing old closed session') ||
-      first.includes('Closing session') ||
-      first.includes('SessionEntry') ||
-      first.includes('Decrypted message with closed session') ||
-      first.includes('Closing open session') ||
-      first.includes('Bad MAC') ||
-      first.startsWith('Session error');
-    if (noise) return;
-  } catch (e) {}
+  const first = String(args[0] || '');
+  if (NOISE_PATTERNS.some(p => first.includes(p))) return;
   origLog.apply(console, args);
 };
+console.error = function (...args) {
+  const first = String(args[0] || '');
+  if (NOISE_PATTERNS.some(p => first.includes(p))) return;
+  origErr.apply(console, args);
+};
+
+console.log('🤖 JARVIS v2.8 start ho raha hai... (naya code confirm)');
 
 const express = require('express');
 const pino = require('pino');
