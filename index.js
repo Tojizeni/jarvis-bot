@@ -1,3 +1,21 @@
+// ===== Terminal saaf rakho — WhatsApp encryption ka shor chhupao =====
+const origLog = console.log;
+console.log = function (...args) {
+  try {
+    const first = String(args[0] || '');
+    const noise =
+      first.includes('Removing old closed session') ||
+      first.includes('Closing session') ||
+      first.includes('SessionEntry') ||
+      first.includes('Decrypted message with closed session') ||
+      first.includes('Closing open session') ||
+      first.includes('Bad MAC') ||
+      first.startsWith('Session error');
+    if (noise) return;
+  } catch (e) {}
+  origLog.apply(console, args);
+};
+
 const express = require('express');
 const pino = require('pino');
 const fs = require('fs');
