@@ -1,4 +1,7 @@
-// ===== v2.9: 100% NOISE BLOCK =====
+// ===== JARVIS v3.0 — FINAL =====
+// Groq (primary) + Gemini + OpenRouter | Persistent dedup | Contact memory
+// Silence system | Mute/Unmute | Self-chat notifications | Noise filter
+
 const NOISE_PATTERNS = [
   'Closing session',
   'Removing old closed session',
@@ -40,7 +43,7 @@ console.error = function (...args) {
   origErr.apply(console, args);
 };
 
-console.log('🤖 JARVIS v2.9 start ho raha hai... (naya code confirm)');
+console.log('🤖 JARVIS v3.0 start ho raha hai... (Groq + Gemini + OpenRouter)');
 
 const express = require('express');
 const pino = require('pino');
@@ -58,7 +61,7 @@ const REPLY_TIMEOUT_MS = 45000;
 const MISSED_MSG_WINDOW = 10 * 60 * 1000;
 const MAX_ASKS = 3;
 
-// ==================== AI PROVIDERS (lazy) ====================
+// ==================== AI PROVIDERS (3 wale — lazy) ====================
 function makeClient(keyEnv, baseURL) {
   const key = (process.env[keyEnv] || '').trim();
   if (!key) {
@@ -70,6 +73,16 @@ function makeClient(keyEnv, baseURL) {
 
 function buildTargets() {
   const t = [];
+  // 1) GROQ — primary (14,400+ daily, fastest)
+  const groq = makeClient('GROQ_API_KEY', 'https://api.groq.com/openai/v1');
+  if (groq) {
+    t.push(
+      { provider: 'groq', client: groq, model: "openai/gpt-oss-120b" },
+      { provider: 'groq', client: groq, model: "qwen/qwen3.8-27b" },
+      { provider: 'groq', client: groq, model: "openai/gpt-oss-20b" }
+    );
+  }
+  // 2) GOOGLE (Gemini)
   const googleAI = makeClient('GEMINI_API_KEY', 'https://generativelanguage.googleapis.com/v1beta/openai/');
   if (googleAI) {
     t.push(
@@ -77,6 +90,7 @@ function buildTargets() {
       { provider: 'google', client: googleAI, model: "gemini-2.0-flash" }
     );
   }
+  // 3) OPENROUTER (backup)
   const openrouter = makeClient('OPENROUTER_API_KEY', 'https://openrouter.ai/api/v1');
   if (openrouter) {
     t.push(
@@ -89,32 +103,38 @@ function buildTargets() {
   return t;
 }
 
-const providerBlockedUntil = { openrouter: 0, google: 0 };
+// Quota guard — limit khatam provider ko park kar do
+const providerBlockedUntil = { groq: 0, openrouter: 0, google: 0 };
 
 function noteProviderError(provider, err) {
   const msg = String((err && err.message) || '');
   if (msg.includes('free-models-per-day')) {
-    providerBlockedUntil[provider] = Date.now() + 60 * 60 * 1000;
-    console.log(`🚫 ${provider} ki DAILY limit khatam — 1 ghantay baad khud try karunga`);
+    providerBlockedUntil[provider] = Date.now() + 3 * 60 * 60 * 1000;
+    console.log(`🚫 ${provider} ki DAILY limit khatam — 3 ghantay baad khud try karunga`);
   } else if (provider === 'google' && (msg.includes('429') || (err && err.status === 429))) {
-    const isDaily = /day|quota|exceeded/i.test(msg);
+    const isDaily = /day|quota|exceeded|limit/i.test(msg);
     providerBlockedUntil[provider] = Date.now() + (isDaily ? 60 : 2) * 60 * 1000;
-    console.log(`🚫 Google AI rate-limit — ${isDaily ? '1 ghanta' : '2 min'} cooldown`);
+    console.log(`🚫 Google AI limit — ${isDaily ? '1 ghanta' : '2 min'} cooldown`);
+  } else if (provider === 'groq' && (msg.includes('429') || (err && err.status === 429))) {
+    const isDaily = /per day|RPD|TPD|daily|limit/i.test(msg);
+    providerBlockedUntil[provider] = Date.now() + (isDaily ? 180 : 2) * 60 * 1000;
+    console.log(`🚫 Groq rate-limit — ${isDaily ? '3 ghante' : '2 min'} cooldown`);
   }
 }
 
 function providerStatus() {
   const now = Date.now();
-  const or = !process.env.OPENROUTER_API_KEY ? 'key nahi' :
-    (now < providerBlockedUntil.openrouter ? `🚫 ${Math.ceil((providerBlockedUntil.openrouter-now)/60000)} min band` : '🟢');
-  const g = !process.env.GEMINI_API_KEY ? 'key nahi' :
-    (now < providerBlockedUntil.google ? `🚫 ${Math.ceil((providerBlockedUntil.google-now)/60000)} min band` : '🟢');
-  return { or, g };
+  const fmt = (blocked) => (blocked > now ? `🚫 ${Math.ceil((blocked - now) / 60000)}m` : '🟢');
+  return {
+    q: !process.env.GROQ_API_KEY ? 'key nahi' : fmt(providerBlockedUntil.groq),
+    g: !process.env.GEMINI_API_KEY ? 'key nahi' : fmt(providerBlockedUntil.google),
+    or: !process.env.OPENROUTER_API_KEY ? 'key nahi' : fmt(providerBlockedUntil.openrouter),
+  };
 }
 
 // Keep-alive server
 const app = express();
-app.get('/', (req, res) => res.send('JARVIS v2.9 online! ✅'));
+app.get('/', (req, res) => res.send('JARVIS v3.0 online! ✅'));
 app.listen(process.env.PORT || 3000, () => console.log('Keep-alive server chal raha hai'));
 
 // ==================== CONTACT MEMORY ====================
@@ -155,7 +175,7 @@ function bumpAsks(sender) {
   return 1;
 }
 
-// ==================== SEEN MEMORY (⭐ v2.9: restart-proof dedup) ====================
+// ==================== SEEN MEMORY (restart-proof dedup) ====================
 const SEEN_FILE = path.join(__dirname, 'seen-ids.json');
 const seenIds = new Set();
 const seenTimes = {};
@@ -323,7 +343,7 @@ function systemPromptFor(sender, contact) {
 - Never invent facts about Huzaifa Sahab.${groupNote}`;
 }
 
-// ==================== AI (Racing, multi-provider, quota-aware) ====================
+// ==================== AI (Racing, 3 providers, quota-aware) ====================
 async function getAIReply(messages) {
   const all = buildTargets().filter(t => Date.now() >= providerBlockedUntil[t.provider]);
   if (all.length === 0) throw new Error('AI_LIMIT');
@@ -352,8 +372,16 @@ async function getAIReply(messages) {
       const target = ordered[next++];
       const c = new AbortController();
       controllers.push(c);
+
+      // Groq ke gpt-oss models sochne mein tokens kharch karte hain — control karo
+      const params = { model: target.model, messages, max_tokens: 800 };
+      if (target.provider === 'groq') {
+        params.reasoning_effort = 'low';
+        params.reasoning_format = 'hidden';
+      }
+
       target.client.chat.completions.create(
-        { model: target.model, messages, max_tokens: 600 },
+        params,
         { signal: c.signal }
       ).then(res => {
         let reply = (res.choices[0] && res.choices[0].message.content) || "";
@@ -364,7 +392,8 @@ async function getAIReply(messages) {
         if (settled) return;
         noteProviderError(target.provider, err);
         failures++;
-        console.log(`⚠️ ${target.model} fail (${target.provider}) — agla try`);
+        const detail = String((err && err.message) || 'unknown').slice(0, 150);
+        console.log(`⚠️ ${target.model} fail (${target.provider}): ${detail}`);
         if (failures >= ordered.length) { settled = true; clearInterval(timer); reject(err); }
         else launchNext();
       });
@@ -486,8 +515,8 @@ async function startSock() {
     } else if (connection === 'open') {
       reconnectDelay = 5000;
       const ps = providerStatus();
-      console.log('✅ JARVIS v2.9 is Online!');
-      console.log(`🔌 Google AI: ${ps.g} | OpenRouter: ${ps.or}`);
+      console.log('✅ JARVIS v3.0 is Online!');
+      console.log(`🔌 Groq: ${ps.q} | Google AI: ${ps.g} | OpenRouter: ${ps.or}`);
     }
   });
 
@@ -505,12 +534,12 @@ async function startSock() {
     const sender = msg.key.remoteJid;
     if (!sender || sender === 'status@broadcast') return;
 
-    // ⭐ Dedup — file-based, restart ke baad bhi kaam karta hai
+    // Dedup — restart-proof
     if (seenIds.has(msg.key.id)) return;
 
     const msgTime = (msg.messageTimestamp || (Date.now() / 1000)) * 1000;
 
-    // Append = offline/backlog message — 10 min window
+    // Append = offline/backlog message
     if (type === 'append') {
       const ageSec = Math.round((Date.now() - msgTime) / 1000);
       if (Date.now() - msgTime > MISSED_MSG_WINDOW) {
@@ -521,13 +550,12 @@ async function startSock() {
       console.log(`📥 Offline message mili (${ageSec} sec purani) — process kar raha hoon`);
     }
 
-    // Connection guard — seen mark NAHI karte (restart par dobara mauqa mile)
+    // Connection guard
     if (!sock.user) {
       await new Promise(r => setTimeout(r, 3000));
       if (!sock.user) { console.log('⏳ Connection abhi khula nahi — ye message chhora'); return; }
     }
 
-    // ⭐ Ab final processing — seen mark karo (dobara kabhi process nahi hoga)
     markSeen(msg.key.id);
 
     const text = extractText(msg);
@@ -554,11 +582,11 @@ async function startSock() {
         const up = Math.floor((Date.now() - stats.started) / 60000);
         const ps = providerStatus();
         await botSend(sender, { text:
-`📊 JARVIS v2.9 Status
+`📊 JARVIS v3.0 Status
 ⏱️ Uptime: ${Math.floor(up/60)}h ${up%60}m
 📨 Served: ${stats.served} | 💬 Replies: ${stats.replies} | ⚠️ Errors: ${stats.errors}
 🧠 Last model: ${lastGoodKey || 'n/a'}
-🔌 Google AI: ${ps.g} | OpenRouter: ${ps.or}
+🔌 Groq: ${ps.q} | Google: ${ps.g} | OpenRouter: ${ps.or}
 📇 Contacts known: ${Object.values(learned).filter(c => c.name !== 'unknown').length + staticContacts.length}
  ${botPaused ? '🔴 Paused (.start se on karein)' : '🟢 Active'}` });
         return;
@@ -606,7 +634,6 @@ async function startSock() {
       if (botSentIds.has(msg.key.id)) return;
       if (pendingBotSend[sender] && Date.now() - pendingBotSend[sender] < 5000) return;
 
-      // ⭐ v2.9 FIX: silence asal message-time se (processing time se nahi)
       if (!isGroup(sender)) {
         chatSilence[sender] = Math.max(chatSilence[sender] || 0, msgTime);
         console.log(`👤 Huzaifa Sahab khud baat kar rahe hain — bot is chat mein 5 min chup (us waqt se)`);
@@ -620,12 +647,10 @@ async function startSock() {
     if (text.length > 1000) return;
 
     if (!text.trim() && media) {
-      // ⭐ v2.9: sirf LIVE media notify karo (backlog nahi — wo WhatsApp mein unread hai)
       if (type === 'notify') await safe(() => notifyOwner(sender, `${media} bheji hai — main sirf text parh sakta hoon`));
       return;
     }
 
-    // ⭐ v2.9: notification sirf LIVE messages ke liye — restart par backlog spam nahi
     if (type === 'notify' && !text.trim().startsWith('.') && (!isGroup(sender) || botMentioned(msg))) {
       await safe(() => notifyOwner(sender, text));
     }
@@ -658,7 +683,7 @@ async function startSock() {
     }
     if (cmd === '.help' || cmd === 'help') {
       await botSend(sender, { text:
-`🤖 *JARVIS v2.9* — at your service
+`🤖 *JARVIS v3.0* — at your service
 
 Main Huzaifa Sahab ka AI assistant hoon — kuch bhi pooch lo: general knowledge, coding, translation, ideas, ya unke bare mein.
 
