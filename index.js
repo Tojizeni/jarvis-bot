@@ -14,27 +14,29 @@ const REPLY_TIMEOUT_MS = 45000;
 const MISSED_MSG_WINDOW = 10 * 60 * 1000;
 const MAX_ASKS = 3;
 
-// ==================== AI PROVIDERS (dono free) ====================
-const openrouter = new OpenAI({
-  apiKey: process.env.OPENROUTER_API_KEY,
-  baseURL: "https://openrouter.ai/api/v1"
-});
 
-const googleAI = new OpenAI({
-  apiKey: process.env.GEMINI_API_KEY,
-  baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/"
-});
+// ==================== AI PROVIDERS (lazy — key na ho to crash nahi) ====================
+function makeClient(keyEnv, baseURL) {
+  const key = (process.env[keyEnv] || '').trim();
+  if (!key) {
+    console.log(`⚠️ ${keyEnv} set nahi hai — us provider ke models skip honge`);
+    return null;
+  }
+  return new OpenAI({ apiKey: key, baseURL });
+}
 
 // Gemini pehle (limit bohot hai), OpenRouter backup
 function buildTargets() {
   const t = [];
-  if (process.env.GEMINI_API_KEY) {
+  const googleAI = makeClient('GEMINI_API_KEY', 'https://generativelanguage.googleapis.com/v1beta/openai/');
+  if (googleAI) {
     t.push(
       { provider: 'google', client: googleAI, model: "gemini-2.5-flash" },
       { provider: 'google', client: googleAI, model: "gemini-2.0-flash" }
     );
   }
-  if (process.env.OPENROUTER_API_KEY) {
+  const openrouter = makeClient('OPENROUTER_API_KEY', 'https://openrouter.ai/api/v1');
+  if (openrouter) {
     t.push(
       { provider: 'openrouter', client: openrouter, model: "nvidia/nemotron-3-ultra-550b-a55b:free" },
       { provider: 'openrouter', client: openrouter, model: "nvidia/nemotron-3-super-120b-a12b:free" },
