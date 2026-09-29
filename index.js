@@ -7,7 +7,6 @@ const NOISE_PATTERNS = [
   'Bad MAC',
   'Decrypted message with closed session',
   'Session error',
-  'Failed to decrypt message with any known session',
 ];
 
 function patchStream(stream) {
