@@ -1,4 +1,4 @@
-// ===== v2.8: 100% NOISE BLOCK (stdout + stderr — har rasta band) =====
+// ===== v2.9: 100% NOISE BLOCK =====
 const NOISE_PATTERNS = [
   'Closing session',
   'Removing old closed session',
@@ -7,9 +7,9 @@ const NOISE_PATTERNS = [
   'Bad MAC',
   'Decrypted message with closed session',
   'Session error',
+  'Failed to decrypt message with any known session',
 ];
 
-// Har output stream ko patch karo — chahe noise kahin se bhi aaye, pakda jayega
 function patchStream(stream) {
   const orig = stream.write.bind(stream);
   stream.write = function (chunk, enc, cb) {
@@ -29,7 +29,6 @@ function patchStream(stream) {
 patchStream(process.stdout);
 patchStream(process.stderr);
 
-// console bhi wrap karo (double protection)
 const origLog = console.log, origErr = console.error;
 console.log = function (...args) {
   const first = String(args[0] || '');
@@ -42,7 +41,7 @@ console.error = function (...args) {
   origErr.apply(console, args);
 };
 
-console.log('🤖 JARVIS v2.8 start ho raha hai... (naya code confirm)');
+console.log('🤖 JARVIS v2.9 start ho raha hai... (naya code confirm)');
 
 const express = require('express');
 const pino = require('pino');
@@ -60,8 +59,7 @@ const REPLY_TIMEOUT_MS = 45000;
 const MISSED_MSG_WINDOW = 10 * 60 * 1000;
 const MAX_ASKS = 3;
 
-
-// ==================== AI PROVIDERS (lazy — key na ho to crash nahi) ====================
+// ==================== AI PROVIDERS (lazy) ====================
 function makeClient(keyEnv, baseURL) {
   const key = (process.env[keyEnv] || '').trim();
   if (!key) {
@@ -71,7 +69,6 @@ function makeClient(keyEnv, baseURL) {
   return new OpenAI({ apiKey: key, baseURL });
 }
 
-// Gemini pehle (limit bohot hai), OpenRouter backup
 function buildTargets() {
   const t = [];
   const googleAI = makeClient('GEMINI_API_KEY', 'https://generativelanguage.googleapis.com/v1beta/openai/');
@@ -93,7 +90,6 @@ function buildTargets() {
   return t;
 }
 
-// Quota guard — limit khatam provider ko thori der ke liye band kar do
 const providerBlockedUntil = { openrouter: 0, google: 0 };
 
 function noteProviderError(provider, err) {
@@ -119,7 +115,7 @@ function providerStatus() {
 
 // Keep-alive server
 const app = express();
-app.get('/', (req, res) => res.send('JARVIS v2.7 online! ✅'));
+app.get('/', (req, res) => res.send('JARVIS v2.9 online! ✅'));
 app.listen(process.env.PORT || 3000, () => console.log('Keep-alive server chal raha hai'));
 
 // ==================== CONTACT MEMORY ====================
@@ -160,6 +156,36 @@ function bumpAsks(sender) {
   return 1;
 }
 
+// ==================== SEEN MEMORY (⭐ v2.9: restart-proof dedup) ====================
+const SEEN_FILE = path.join(__dirname, 'seen-ids.json');
+const seenIds = new Set();
+const seenTimes = {};
+try {
+  const saved = JSON.parse(fs.readFileSync(SEEN_FILE, 'utf-8'));
+  const cutoff = Date.now() - 2 * 60 * 60 * 1000;
+  for (const [id, ts] of Object.entries(saved)) {
+    if (typeof ts === 'number' && ts > cutoff) { seenIds.add(id); seenTimes[id] = ts; }
+  }
+} catch (e) {}
+
+let seenSaveTimer = null;
+function markSeen(id) {
+  if (!id) return;
+  seenIds.add(id);
+  seenTimes[id] = Date.now();
+  if (seenSaveTimer) return;
+  seenSaveTimer = setTimeout(() => {
+    seenSaveTimer = null;
+    try {
+      const cutoff = Date.now() - 2 * 60 * 60 * 1000;
+      for (const [k, ts] of Object.entries(seenTimes)) {
+        if (ts < cutoff) { delete seenTimes[k]; seenIds.delete(k); }
+      }
+      fs.writeFileSync(SEEN_FILE, JSON.stringify(seenTimes));
+    } catch (e) {}
+  }, 3000);
+}
+
 // ==================== STATE ====================
 let lastGoodKey = null;
 let botPaused = false;
@@ -171,7 +197,6 @@ const chatSilence = {};
 const chatMuted = {};
 const pendingBotSend = {};
 const botSentIds = new Set();
-const seenIds = new Set();
 const chatQueues = {};
 const stats = { started: Date.now(), served: 0, replies: 0, errors: 0 };
 
@@ -231,11 +256,6 @@ function trackBotMsg(sent) {
     botSentIds.add(sent.key.id);
     if (botSentIds.size > 1000) botSentIds.delete(botSentIds.values().next().value);
   }
-}
-
-function markSeen(id) {
-  seenIds.add(id);
-  if (seenIds.size > 2000) seenIds.delete(seenIds.values().next().value);
 }
 
 function enqueue(sender, task) {
@@ -365,7 +385,6 @@ function tryExtractName(text) {
     /mera\s+naam\s+([a-zA-Z\u0600-\u06FF][a-zA-Z\u0600-\u06FF\s]{1,25}?)\s*(?:hai|h)?[.!。\s]*$/i,
     /my\s+name\s+is\s+([a-zA-Z][a-zA-Z\s]{1,25}?)\s*(?:h'?e'?re)?[.!]*$/i,
     /main\s+([A-Z][a-zA-Z]{2,20})\s+(?:bol|bol\s+raha|bol\s+rahi|hun|hoon)/i,
-    /(?:i\s+am|i'm|im)\s+([A-Z][a-zA-Z]{2,20})\b/i,
     /^([A-Z][a-zA-Z]{2,20})\s+(?:here|bol\s+raha\s+hun|this\s+side)$/i,
   ];
   for (const p of patterns) {
@@ -468,14 +487,14 @@ async function startSock() {
     } else if (connection === 'open') {
       reconnectDelay = 5000;
       const ps = providerStatus();
-      console.log('✅ JARVIS v2.7 is Online!');
+      console.log('✅ JARVIS v2.9 is Online!');
       console.log(`🔌 Google AI: ${ps.g} | OpenRouter: ${ps.or}`);
     }
   });
 
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify' && type !== 'append') return;
-    if (messages.length > 1) console.log(`📦 ${messages.length} messages ek sath aayin — SAB process karunga`);
+    if (messages.length > 1) console.log(`📦 ${messages.length} messages ek sath aayin`);
     for (const msg of messages) {
       try { await processMessage(msg, type); }
       catch (e) { console.error('Msg process error:', e && e.message); }
@@ -487,24 +506,30 @@ async function startSock() {
     const sender = msg.key.remoteJid;
     if (!sender || sender === 'status@broadcast') return;
 
+    // ⭐ Dedup — file-based, restart ke baad bhi kaam karta hai
     if (seenIds.has(msg.key.id)) return;
-    markSeen(msg.key.id);
 
     const msgTime = (msg.messageTimestamp || (Date.now() / 1000)) * 1000;
 
+    // Append = offline/backlog message — 10 min window
     if (type === 'append') {
       const ageSec = Math.round((Date.now() - msgTime) / 1000);
       if (Date.now() - msgTime > MISSED_MSG_WINDOW) {
+        markSeen(msg.key.id);
         console.log(`📵 Offline message ${ageSec} sec purani thi — skip`);
         return;
       }
       console.log(`📥 Offline message mili (${ageSec} sec purani) — process kar raha hoon`);
     }
 
+    // Connection guard — seen mark NAHI karte (restart par dobara mauqa mile)
     if (!sock.user) {
       await new Promise(r => setTimeout(r, 3000));
       if (!sock.user) { console.log('⏳ Connection abhi khula nahi — ye message chhora'); return; }
     }
+
+    // ⭐ Ab final processing — seen mark karo (dobara kabhi process nahi hoga)
+    markSeen(msg.key.id);
 
     const text = extractText(msg);
 
@@ -530,7 +555,7 @@ async function startSock() {
         const up = Math.floor((Date.now() - stats.started) / 60000);
         const ps = providerStatus();
         await botSend(sender, { text:
-`📊 JARVIS v2.7 Status
+`📊 JARVIS v2.9 Status
 ⏱️ Uptime: ${Math.floor(up/60)}h ${up%60}m
 📨 Served: ${stats.served} | 💬 Replies: ${stats.replies} | ⚠️ Errors: ${stats.errors}
 🧠 Last model: ${lastGoodKey || 'n/a'}
@@ -582,9 +607,10 @@ async function startSock() {
       if (botSentIds.has(msg.key.id)) return;
       if (pendingBotSend[sender] && Date.now() - pendingBotSend[sender] < 5000) return;
 
+      // ⭐ v2.9 FIX: silence asal message-time se (processing time se nahi)
       if (!isGroup(sender)) {
-        chatSilence[sender] = Date.now();
-        console.log(`👤 Huzaifa Sahab khud baat kar rahe hain — bot is chat mein ${SILENCE_MINUTES} min chup`);
+        chatSilence[sender] = Math.max(chatSilence[sender] || 0, msgTime);
+        console.log(`👤 Huzaifa Sahab khud baat kar rahe hain — bot is chat mein 5 min chup (us waqt se)`);
       }
       return;
     }
@@ -595,11 +621,13 @@ async function startSock() {
     if (text.length > 1000) return;
 
     if (!text.trim() && media) {
-      await safe(() => notifyOwner(sender, `${media} bheji hai — main sirf text parh sakta hoon`));
+      // ⭐ v2.9: sirf LIVE media notify karo (backlog nahi — wo WhatsApp mein unread hai)
+      if (type === 'notify') await safe(() => notifyOwner(sender, `${media} bheji hai — main sirf text parh sakta hoon`));
       return;
     }
 
-    if (!text.trim().startsWith('.') && (!isGroup(sender) || botMentioned(msg))) {
+    // ⭐ v2.9: notification sirf LIVE messages ke liye — restart par backlog spam nahi
+    if (type === 'notify' && !text.trim().startsWith('.') && (!isGroup(sender) || botMentioned(msg))) {
       await safe(() => notifyOwner(sender, text));
     }
 
@@ -631,7 +659,7 @@ async function startSock() {
     }
     if (cmd === '.help' || cmd === 'help') {
       await botSend(sender, { text:
-`🤖 *JARVIS v2.7* — at your service
+`🤖 *JARVIS v2.9* — at your service
 
 Main Huzaifa Sahab ka AI assistant hoon — kuch bhi pooch lo: general knowledge, coding, translation, ideas, ya unke bare mein.
 
@@ -652,7 +680,6 @@ Main Huzaifa Sahab ka AI assistant hoon — kuch bhi pooch lo: general knowledge
         setLearned(sender, maybeName, 'contact');
         contact = { name: maybeName, relation: 'contact', source: 'learned' };
         console.log(`📇 Naya contact save hua: ${maybeName} (${sender})`);
-        await safe(() => notifyOwner(sender, `(auto-saved name: ${maybeName})`));
       }
     }
 
@@ -703,7 +730,7 @@ Main Huzaifa Sahab ka AI assistant hoon — kuch bhi pooch lo: general knowledge
       if (chatHistory[sender]) chatHistory[sender].pop();
       console.error('=== ERROR ===', error.message);
       const msg1 = (error.message === 'AI_LIMIT')
-        ? 'Aaj ki free AI limits thori der ke liye khatam ho gayi hain 🙏 Kuch der baad dobara bhejein — main khud try karta rahunga.'
+        ? 'Aaj ki free AI limits thori der ke liye khatam ho gayi hain 🙏 Kuch der baad dobara bhejein.'
         : '⚠️ AI servers abhi busy hain. Thodi der baad dobara bhejein.';
       await botSend(sender, { text: msg1 }, msg);
     } finally {
