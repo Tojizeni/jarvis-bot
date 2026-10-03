@@ -1,8 +1,8 @@
 // ================================================================
-// JARVIS v3.3 — SMART FORWARDING BUILD
-// - Broad forward intent (dm/batao/text/can you...sab pakadta hai)
-// - State machine: message poochta hai -> naam poochta hai -> forward
-// - AI ko forwarding ka pata hai (kabhi "can't" nahi bolega)
+// JARVIS v3.4 — COMPLETE BUILD (VOICE + SMART FORWARD)
+// 🎙️ Voice notes (Whisper via Groq) | 📤 Smart forwarding
+// 3 AI providers | Contact memory | Mute/Unmute | Persistent dedup
+// Self-chat notifications | Racing models | Quota guard | Noise filter
 // ================================================================
 
 const NOISE_PATTERNS = [
@@ -46,7 +46,7 @@ console.error = function (...args) {
   origErr.apply(console, args);
 };
 
-console.log('🤖 JARVIS v3.3 start ho raha hai... (smart forwarding)');
+console.log('🤖 JARVIS v3.4 start ho raha hai... (voice + forwarding)');
 
 const express = require('express');
 const pino = require('pino');
@@ -132,7 +132,7 @@ function providerStatus() {
 }
 
 const app = express();
-app.get('/', (req, res) => res.send('JARVIS v3.3 online! ✅'));
+app.get('/', (req, res) => res.send('JARVIS v3.4 online! ✅'));
 app.listen(process.env.PORT || 3000, () => console.log('Keep-alive server chal raha hai'));
 
 // ==================== CONTACT MEMORY ====================
@@ -207,7 +207,7 @@ const chatMuted = {};
 const pendingBotSend = {};
 const botSentIds = new Set();
 const chatQueues = {};
-const forwardFlow = {};  // ⭐ sender -> { stage: 'content'|'name', content, startedAt }
+const forwardFlow = {};
 const stats = { started: Date.now(), served: 0, replies: 0, errors: 0 };
 
 // ==================== HELPERS ====================
@@ -284,32 +284,67 @@ function senderLabel(sender) {
   return `+${rawNum}`;
 }
 
-// ⭐⭐ SMART FORWARD INTENT — har tareeqe ki request pakadta hai ⭐⭐
+// ==================== 🎙️ WHISPER TRANSCRIBE ====================
+async function transcribeAudio(sock, msg) {
+  try {
+    const groqKey = (process.env.GROQ_API_KEY || '').trim();
+    if (!groqKey) {
+      console.log('⚠️ GROQ_API_KEY nahi hai — voice transcribe nahi hoga');
+      return null;
+    }
+
+    const buffer = await sock.downloadMediaMessage(msg);
+    if (!buffer || buffer.length === 0) return null;
+
+    const { FormData, Blob } = require('buffer');
+    const fd = new FormData();
+    fd.append('file', new Blob([buffer], { type: 'audio/ogg' }), 'voice.ogg');
+    fd.append('model', 'whisper-large-v3-turbo');
+    fd.append('response_format', 'json');
+    // Urdu force karni ho to neeche wali line uncomment karo:
+    // fd.append('language', 'ur');
+
+    const res = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${groqKey}` },
+      body: fd
+    });
+
+    if (!res.ok) {
+      const errText = await res.text().catch(() => '');
+      console.log(`⚠️ Whisper fail: ${res.status} ${errText.slice(0, 120)}`);
+      return null;
+    }
+
+    const data = await res.json();
+    return (data.text || '').trim();
+  } catch (e) {
+    console.log('Transcribe error:', e && e.message);
+    return null;
+  }
+}
+
+// ==================== FORWARD INTENT ====================
 function isForwardIntent(text) {
   const t = ' ' + text.toLowerCase().trim() + ' ';
 
   const hasTarget = /(huzaifa|malik|owner|sahab|boss|unko|unhe|unho|inhe|unkoo|him\b|himself)/.test(t);
   if (!hasTarget) return false;
 
-  // Ye sirf status-sawal hain — forward NAHI
   const isWhereabouts = /(kahan|kaha\b|kab\s*aay|kab\s*ae|free\s*hai|available|online\s*hai|uth\s*gay|so\s*ray|so\s*raha|university\s*mein|ghar\s*par|busy\s*hai|kaise\s*hain|kya\s*kar\s*raha|kya\s*karte)/.test(t);
 
-  // Forward/action words — bohot broad
   const hasAction = /(poncha|pahuncha|pohanch|pohncha|puncha|phncha|bhej|forward|send|dm\b|d\.m|convey|bata\s*(do|dijiye|dena|de\b)|batana|batado|batao|itla|khabar\s*do|message\s*(karo|kar\b|do\b|bhej)|msg\s*(karo|kar\b|do\b|bhej)|text\s*(karo|kar\b|him\b|do\b)|contact\s*(karo|kar\b)|reach\s*(out|karo)|pass\s*karo|tell\s*(him|huzaifa)|ask\s*(him|huzaifa)|arrange|pohancha\s*do)/.test(t);
 
-  // Capability questions: "kya aap bhej sakte ho", "can you send him", "forward kar sakte?"
   const isCapability = /(sakte|sakti|can\s*you|could\s*you|will\s*you|would\s*you|hoga|ho\s*sakta|possible|mumkin|kar\s*sakte)/.test(t);
 
   if (isWhereabouts) return false;
   return hasAction || isCapability;
 }
 
-// ⭐ Message ke andar se content nikaalo: "batao ke main aa raha hun"
 function extractForwardContent(text) {
   let m = text.match(/(?:bata\s*(?:do|dijiye|dena|de\b)|batana|batado|keh\s*(?:do|dijiye|dena)|convey|itla\s*do|pohancha\s*do|poncha\s*do|pahuncha\s*do|pohncha\s*do|bhej\s*(?:do|dijiye|dena)|forward|send)\s*(?:him|huzaifa|sahab|malik|unko|unhe|ko)?\s*(?:ke|ki|k\b|:|-)?\s*(.+)/i);
   if (m && m[1]) {
     const content = m[1].trim();
-    // "ke/ki" ke baad ka hissa asli message hota hai
     const keMatch = content.match(/^(?:ke|ki|k)\s+(.+)/i);
     const final = keMatch ? keMatch[1].trim() : content;
     if (final.length >= 3 && final.length <= 500) return final;
@@ -322,7 +357,7 @@ function tryExtractName(text) {
     /mera\s+naam\s+([a-zA-Z\u0600-\u06FF][a-zA-Z\u0600-\u06FF\s]{1,25}?)\s*(?:hai|h)?[.!。\s]*$/i,
     /my\s+name\s+is\s+([a-zA-Z][a-zA-Z\s]{1,25}?)\s*(?:h'?e'?re)?[.!]*$/i,
     /main\s+([A-Z][a-zA-Z]{2,20})\s+(?:bol|bol\s+raha|bol\s+rahi|hun|hoon)/i,
-    /^([A-Z][a-zA-Z]{2,20})\s+(?:here|bol\s+raha\s+hun|this\s+side)$/i,
+    /^([A-Z][a-zA-Z]{2,20})\s+(?:here|bol\s+raha\s*hun|this\s+side)$/i,
   ];
   for (const p of patterns) {
     const m = text.match(p);
@@ -367,8 +402,8 @@ function systemPromptFor(sender, contact) {
  ${whoNote}
 
 === ⭐ SPECIAL ABILITY: MESSAGE FORWARDING ⭐
-Tum Huzaifa Sahab tak messages pohancha SAKTE ho! Agar user kahe "Huzaifa Sahab ko message bhejo/ponchao", "can you text/dm him?", "uskoo bata do" — to HAMESHA positive jawab do: "Ji bilkul! Aap apna message likh dijiye, main Huzaifa Sahab tak pohancha dunga ✅"
-KABHI bhi "main forward nahi kar sakta", "I can't send messages", "main sirf AI hoon message nahi bhej sakta" MAT bolo — ye GALAT hai, tum ye kar sakte ho.
+Tum Huzaifa Sahab tak messages pohancha SAKTE ho! Agar user forwarding ki baat kare ("Huzaifa Sahab ko message bhejo/ponchao", "can you text/dm him?", "uskoo bata do") — to HAMESHA positive jawab do: "Ji bilkul! Aap apna message likh dijiye, main Huzaifa Sahab tak pohancha dunga ✅"
+KABHI bhi "main forward nahi kar sakta", "I can't send messages" MAT bolo — ye GALAT hai, tum ye kar sakte ho.
 (Zyada tar requests automatic pakki jayengi — ye instruction sirf backup hai.)
 
 === TONE: Real Assistant, NOT ChatGPT ===
@@ -377,6 +412,7 @@ KABHI bhi "main forward nahi kar sakta", "I can't send messages", "main sirf AI 
 - English/Urdu natural mix mein baat karo (jaise Pakistani log WhatsApp par karte hain). User sirf English bole to English, sirf Urdu bole to Urdu.
 - Short replies (1-4 lines mostly). Emojis kam lekin natural.
 - Known contacts ko naam se address karo — personal touch.
+- User voice note bheje aur transcript aaye to normal message ki tarah jawab do — bolo mat ke "maine aapki voice suni", bas seedha jawab do jo bola gaya.
 
 === HOW TO HANDLE THINGS ===
 1. Agar koi Huzaifa Sahab ko dhoondta hai (kahan hai/free hai) → routine se jawab do: "Huzaifa Sahab abhi University mein honge (Mon-Thu 7AM-2PM) ke hisaab se... lekin main live track nahi kar sakta, exact nahi pata."
@@ -516,7 +552,6 @@ async function startSock() {
     } catch (e) { console.log('Notify fail:', e && e.message); }
   }
 
-  // ⭐ FORWARD — Huzaifa Sahab tak message pohanchana
   async function forwardToOwner(sender, name, messageText) {
     try {
       const fromLabel = senderLabel(sender);
@@ -573,7 +608,7 @@ async function startSock() {
     } else if (connection === 'open') {
       reconnectDelay = 5000;
       const ps = providerStatus();
-      console.log('✅ JARVIS v3.3 is Online!');
+      console.log('✅ JARVIS v3.4 is Online!');
       console.log(`🔌 Groq: ${ps.q} | Google AI: ${ps.g} | OpenRouter: ${ps.or}`);
     }
   });
@@ -620,7 +655,7 @@ async function startSock() {
 
     markSeen(msg.key.id);
 
-    const text = extractText(msg);
+    let text = extractText(msg);
 
     // ========== HUZAIFA SAHAB KI APNI MESSAGES ==========
     if (msg.key.fromMe) {
@@ -647,12 +682,13 @@ async function startSock() {
         const up = Math.floor((Date.now() - stats.started) / 60000);
         const ps = providerStatus();
         await botSend(sender, { text:
-`📊 JARVIS v3.3 Status
+`📊 JARVIS v3.4 Status
 ⏱️ Uptime: ${Math.floor(up/60)}h ${up%60}m
 📨 Served: ${stats.served} | 💬 Replies: ${stats.replies} | ⚠️ Errors: ${stats.errors}
 🧠 Last model: ${lastGoodKey || 'n/a'}
 🔌 Groq: ${ps.q} | Google: ${ps.g} | OpenRouter: ${ps.or}
 📇 Contacts: ${Object.values(learned).filter(c => c.name !== 'unknown').length + staticContacts.length} | 📤 Active forwards: ${Object.keys(forwardFlow).length}
+🎙️ Voice: ON (Whisper)
  ${botPaused ? '🔴 Paused' : '🟢 Active'}` });
         return;
       }
@@ -707,14 +743,28 @@ async function startSock() {
     }
 
     // ========== DUSRON KI MESSAGES ==========
-    const media = mediaType(msg);
-    if (!text.trim() && !media) return;
-    if (text.length > 1000) return;
 
+    // 🎙️ VOICE NOTE — transcribe kar ke text banao
+    if (msg.message.audioMessage && !text.trim()) {
+      console.log(`🎙️ Voice note aayi (${sender}) — transcribe kar raha hoon...`);
+      const transcript = await transcribeAudio(sock, msg);
+      if (transcript && transcript.trim()) {
+        console.log(`📝 Transcript: ${transcript.slice(0, 100)}`);
+        await safe(() => notifyOwner(sender, `🎙️ Voice: "${transcript.slice(0, 200)}"`));
+        text = transcript;
+      } else {
+        await botSend(sender, { text: '🎙️ Voice samajh nahi aayi — dobara bhejein ya text likh dein.' }, msg);
+        return;
+      }
+    }
+
+    // Baqi media (photo/video/file) — abhi support nahi
+    const media = mediaType(msg);
     if (!text.trim() && media) {
-      if (type === 'notify') await safe(() => notifyOwner(sender, `${media} bheji hai — main sirf text parh sakta hoon`));
+      if (type === 'notify') await safe(() => notifyOwner(sender, `${media} bheji hai — abhi main text aur voice notes samajh sakta hoon`));
       return;
     }
+    if (text.length > 1000) return;
 
     if (type === 'notify' && !text.trim().startsWith('.') && (!isGroup(sender) || botMentioned(msg))) {
       await safe(() => notifyOwner(sender, text));
@@ -748,12 +798,12 @@ async function startSock() {
     }
     if (cmd === '.help' || cmd === 'help') {
       await botSend(sender, { text:
-`🤖 *JARVIS v3.3* — at your service
+`🤖 *JARVIS v3.4* — at your service
 
-Main Huzaifa Sahab ka AI assistant hoon — kuch bhi pooch lo.
+Main Huzaifa Sahab ka AI assistant hoon — kuch bhi pooch lo. Voice note bhi bhej sakte hain, main samajh leta hoon 🎙️
 
 📤 *Message forwarding:*
-"ye message Huzaifa Sahab tak ponchao" ya "Huzaifa Sahab ko bata do" — main un tak pohancha dunga ✅
+"Huzaifa Sahab ko bata do" ya "message ponchao" — main un tak pohancha dunga ✅
 
 📋 Commands:
 • .time — exact waqt
@@ -761,22 +811,20 @@ Main Huzaifa Sahab ka AI assistant hoon — kuch bhi pooch lo.
       return;
     }
 
-    // ⭐⭐ STEP 1: Koi FORWARD FLOW CHAL RAHA HAI? (message/name ka intezaar) ⭐⭐
+    // ⭐ FORWARD FLOW ACTIVE HAI? (content/name ka intezaar)
     if (forwardFlow[sender]) {
       const ff = forwardFlow[sender];
 
-      // Timeout — 10 min baad flow khud cancel
       if (Date.now() - ff.startedAt > FORWARD_FLOW_TIMEOUT) {
         delete forwardFlow[sender];
         console.log(`⏰ Forward flow timeout (${sender}) — cancel`);
-        // timeout ke baad message aage normal process hoga
+        // timeout ke baad ye message normal process hoga (neeche jayega)
       } else if (cmd === 'cancel' || cmd === '.cancel' || cmd === 'chor do') {
         delete forwardFlow[sender];
-        await botSend(sender, { text: 'Theek hai — forwarding cancel kar diya. Jab chahiye ho phir bata dena 😊' }, msg);
+        await botSend(sender, { text: 'Theek hai — forwarding cancel kar di. Jab chahiye ho phir bata dena 😊' }, msg);
         console.log(`🚫 Forward cancel (${sender})`);
         return;
       } else if (ff.stage === 'content') {
-        // Ye message hi forward hone wala content hai
         ff.content = text.trim();
         const contact = lookupContact(sender);
         if (contact && contact.name) {
@@ -795,7 +843,7 @@ Main Huzaifa Sahab ka AI assistant hoon — kuch bhi pooch lo.
         const trimmed = text.trim();
         let name = tryExtractName(trimmed);
         if (!name && /^[a-zA-Z\u0600-\u06FF][a-zA-Z\u0600-\u06FF\s.]{1,24}$/.test(trimmed)) {
-          name = trimmed; // sirf naam likha hai ("Ali")
+          name = trimmed;
         }
         if (name) setLearned(sender, name, 'contact');
         const useName = name || 'Unknown';
@@ -809,13 +857,12 @@ Main Huzaifa Sahab ka AI assistant hoon — kuch bhi pooch lo.
       }
     }
 
-    // ⭐⭐ STEP 2: NAYI FORWARD REQUEST? (har tareeqe se) ⭐⭐
+    // ⭐ NAYI FORWARD REQUEST?
     if (!cmd.startsWith('.') && isForwardIntent(text)) {
       const contact = lookupContact(sender);
       const content = extractForwardContent(text);
 
       if (content) {
-        // Message ke andar hi content tha: "batao ke main kal aaunga"
         if (contact && contact.name) {
           const ok = await forwardToOwner(sender, contact.name, content);
           await botSend(sender, { text: ok
@@ -828,7 +875,6 @@ Main Huzaifa Sahab ka AI assistant hoon — kuch bhi pooch lo.
           console.log(`📤 Forward pending naam ka (${sender})`);
         }
       } else {
-        // Content nahi tha — poochho ke kya bhejna hai
         forwardFlow[sender] = { stage: 'content', content: null, startedAt: Date.now() };
         await botSend(sender, { text: `Ji bilkul! Main Huzaifa Sahab tak aapka message pohancha dunga ✅
 
