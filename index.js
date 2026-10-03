@@ -284,7 +284,7 @@ function senderLabel(sender) {
   return `+${rawNum}`;
 }
 
-// ==================== 🎙️ WHISPER TRANSCRIBE ====================
+// ==================== 🎙️ WHISPER TRANSCRIBE (v2 — reliable + debug) ====================
 async function transcribeAudio(sock, msg) {
   try {
     const groqKey = (process.env.GROQ_API_KEY || '').trim();
@@ -293,33 +293,71 @@ async function transcribeAudio(sock, msg) {
       return null;
     }
 
-    const buffer = await sock.downloadMediaMessage(msg);
-    if (!buffer || buffer.length === 0) return null;
+    const audioMsg = msg.message.audioMessage;
+    if (!audioMsg) return null;
+    console.log(`🔧 Debug: mimetype = ${audioMsg.mimetype || 'unknown'} | size = ${audioMsg.fileLength || '?'} bytes`);
 
-    const { FormData, Blob } = require('buffer');
-    const fd = new FormData();
-    fd.append('file', new Blob([buffer], { type: 'audio/ogg' }), 'voice.ogg');
-    fd.append('model', 'whisper-large-v3-turbo');
-    fd.append('response_format', 'json');
-    // Urdu force karni ho to neeche wali line uncomment karo:
-    // fd.append('language', 'ur');
+    // ---- Step 1: Stream se download (reliable method) ----
+    let buffer;
+    try {
+      const { downloadContentFromMessage } = require('@whiskeysockets/baileys');
+      const stream = await downloadContentFromMessage(audioMsg, 'audio');
+      const chunks = [];
+      for await (const chunk of stream) {
+        chunks.push(chunk);
+      }
+      buffer = Buffer.concat(chunks);
+    } catch (e) {
+      console.log(`🔧 Download fail: ${e && e.message}`);
+      return null;
+    }
 
+    if (!buffer || buffer.length === 0) {
+      console.log('🔧 Download: khaali buffer aaya');
+      return null;
+    }
+    console.log(`🔧 Download OK: ${buffer.length} bytes milay`);
+
+    // ---- Step 2: Manual multipart body (har Node version par chalta hai) ----
+    const boundary = '----jarvis' + Date.now();
+    const mime = audioMsg.mimetype || 'audio/ogg; codecs=opus';
+
+    const pre = Buffer.from(
+      `--${boundary}\r\n` +
+      `Content-Disposition: form-data; name="file"; filename="voice.ogg"\r\n` +
+      `Content-Type: ${mime}\r\n\r\n`
+    );
+    const post = Buffer.from(
+      `\r\n--${boundary}\r\n` +
+      `Content-Disposition: form-data; name="model"\r\n\r\nwhisper-large-v3-turbo\r\n` +
+      `--${boundary}\r\n` +
+      `Content-Disposition: form-data; name="response_format"\r\n\r\njson\r\n` +
+      `--${boundary}--\r\n`
+    );
+    const body = Buffer.concat([pre, buffer, post]);
+
+    // ---- Step 3: Groq Whisper API ----
     const res = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
       method: 'POST',
-      headers: { 'Authorization': `Bearer ${groqKey}` },
-      body: fd
+      headers: {
+        'Authorization': `Bearer ${groqKey}`,
+        'Content-Type': `multipart/form-data; boundary=${boundary}`
+      },
+      body: body
     });
 
     if (!res.ok) {
       const errText = await res.text().catch(() => '');
-      console.log(`⚠️ Whisper fail: ${res.status} ${errText.slice(0, 120)}`);
+      console.log(`🔧 Whisper API fail: ${res.status} — ${errText.slice(0, 200)}`);
       return null;
     }
 
     const data = await res.json();
-    return (data.text || '').trim();
+    const text = (data.text || '').trim();
+    console.log(`🔧 Whisper OK: "${text.slice(0, 80)}"`);
+    return text;
   } catch (e) {
-    console.log('Transcribe error:', e && e.message);
+    console.log('🔧 Transcribe error:', e && e.message);
     return null;
   }
 }
