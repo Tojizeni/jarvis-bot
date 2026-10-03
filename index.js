@@ -1,8 +1,8 @@
 // ================================================================
-// JARVIS v3.2 — FINAL BUILD
-// NEW: Forward-to-Huzaifa feature | Name asking SIRF forward par
-// NEW: .notifytest diagnostic | LID-saaf labels
-// Fixed: no more name spam | self-chat guards | persistent dedup
+// JARVIS v3.3 — SMART FORWARDING BUILD
+// - Broad forward intent (dm/batao/text/can you...sab pakadta hai)
+// - State machine: message poochta hai -> naam poochta hai -> forward
+// - AI ko forwarding ka pata hai (kabhi "can't" nahi bolega)
 // ================================================================
 
 const NOISE_PATTERNS = [
@@ -46,7 +46,7 @@ console.error = function (...args) {
   origErr.apply(console, args);
 };
 
-console.log('🤖 JARVIS v3.2 start ho raha hai... (forwarding + no name-spam)');
+console.log('🤖 JARVIS v3.3 start ho raha hai... (smart forwarding)');
 
 const express = require('express');
 const pino = require('pino');
@@ -62,6 +62,7 @@ const BOT_JID = BOT_PHONE + "@s.whatsapp.net";
 const SILENCE_MINUTES = 5;
 const REPLY_TIMEOUT_MS = 45000;
 const MISSED_MSG_WINDOW = 10 * 60 * 1000;
+const FORWARD_FLOW_TIMEOUT = 10 * 60 * 1000;
 
 // ==================== AI PROVIDERS ====================
 function makeClient(keyEnv, baseURL) {
@@ -131,7 +132,7 @@ function providerStatus() {
 }
 
 const app = express();
-app.get('/', (req, res) => res.send('JARVIS v3.2 online! ✅'));
+app.get('/', (req, res) => res.send('JARVIS v3.3 online! ✅'));
 app.listen(process.env.PORT || 3000, () => console.log('Keep-alive server chal raha hai'));
 
 // ==================== CONTACT MEMORY ====================
@@ -159,7 +160,7 @@ function lookupContact(sender) {
 }
 
 function setLearned(sender, name, relation) {
-  learned[sender] = { name, relation: relation || 'contact', asks: 0 };
+  learned[sender] = { name, relation: relation || 'contact' };
   saveContacts();
 }
 
@@ -206,7 +207,7 @@ const chatMuted = {};
 const pendingBotSend = {};
 const botSentIds = new Set();
 const chatQueues = {};
-const pendingForwards = {};   // ⭐ sender -> { text, tries } — naam ka intezaar
+const forwardFlow = {};  // ⭐ sender -> { stage: 'content'|'name', content, startedAt }
 const stats = { started: Date.now(), served: 0, replies: 0, errors: 0 };
 
 // ==================== HELPERS ====================
@@ -277,14 +278,43 @@ function enqueue(sender, task) {
     .finally(() => { q.count--; if (q.count === 0) delete chatQueues[sender]; });
 }
 
-// ⭐ FORWARD REQUEST DETECTION — "ye message Huzaifa tak ponchao"
-function isForwardRequest(text) {
-  const t = text.toLowerCase().trim();
-  const hasTarget = /(huzaifa|malik|owner|sahab|boss)/.test(t);
-  const hasAction = /(ponchao|pahunchao|pohanchao|pahuncha|pohancha|bhejo|bhej\s|bhejd|forward|send\s*karo|de\s*do|dedo|dena)/.test(t);
-  const hasMsg = /(msg|message|baat|ye|yeh|khabar|itla)/.test(t);
-  const isQuestion = /(kaise|kahan|kaha\s|kab|kyun|kyo|kaun|kya\s|what|where|when|why|how)/.test(t);
-  return hasTarget && hasAction && hasMsg && !isQuestion;
+function senderLabel(sender) {
+  const rawNum = sender.split('@')[0];
+  if (sender.endsWith('@lid')) return `WhatsApp-ID: ${rawNum}`;
+  return `+${rawNum}`;
+}
+
+// ⭐⭐ SMART FORWARD INTENT — har tareeqe ki request pakadta hai ⭐⭐
+function isForwardIntent(text) {
+  const t = ' ' + text.toLowerCase().trim() + ' ';
+
+  const hasTarget = /(huzaifa|malik|owner|sahab|boss|unko|unhe|unho|inhe|unkoo|him\b|himself)/.test(t);
+  if (!hasTarget) return false;
+
+  // Ye sirf status-sawal hain — forward NAHI
+  const isWhereabouts = /(kahan|kaha\b|kab\s*aay|kab\s*ae|free\s*hai|available|online\s*hai|uth\s*gay|so\s*ray|so\s*raha|university\s*mein|ghar\s*par|busy\s*hai|kaise\s*hain|kya\s*kar\s*raha|kya\s*karte)/.test(t);
+
+  // Forward/action words — bohot broad
+  const hasAction = /(poncha|pahuncha|pohanch|pohncha|puncha|phncha|bhej|forward|send|dm\b|d\.m|convey|bata\s*(do|dijiye|dena|de\b)|batana|batado|batao|itla|khabar\s*do|message\s*(karo|kar\b|do\b|bhej)|msg\s*(karo|kar\b|do\b|bhej)|text\s*(karo|kar\b|him\b|do\b)|contact\s*(karo|kar\b)|reach\s*(out|karo)|pass\s*karo|tell\s*(him|huzaifa)|ask\s*(him|huzaifa)|arrange|pohancha\s*do)/.test(t);
+
+  // Capability questions: "kya aap bhej sakte ho", "can you send him", "forward kar sakte?"
+  const isCapability = /(sakte|sakti|can\s*you|could\s*you|will\s*you|would\s*you|hoga|ho\s*sakta|possible|mumkin|kar\s*sakte)/.test(t);
+
+  if (isWhereabouts) return false;
+  return hasAction || isCapability;
+}
+
+// ⭐ Message ke andar se content nikaalo: "batao ke main aa raha hun"
+function extractForwardContent(text) {
+  let m = text.match(/(?:bata\s*(?:do|dijiye|dena|de\b)|batana|batado|keh\s*(?:do|dijiye|dena)|convey|itla\s*do|pohancha\s*do|poncha\s*do|pahuncha\s*do|pohncha\s*do|bhej\s*(?:do|dijiye|dena)|forward|send)\s*(?:him|huzaifa|sahab|malik|unko|unhe|ko)?\s*(?:ke|ki|k\b|:|-)?\s*(.+)/i);
+  if (m && m[1]) {
+    const content = m[1].trim();
+    // "ke/ki" ke baad ka hissa asli message hota hai
+    const keMatch = content.match(/^(?:ke|ki|k)\s+(.+)/i);
+    const final = keMatch ? keMatch[1].trim() : content;
+    if (final.length >= 3 && final.length <= 500) return final;
+  }
+  return null;
 }
 
 function tryExtractName(text) {
@@ -316,7 +346,7 @@ function systemPromptFor(sender, contact) {
   } else if (contact && contact.name) {
     whoNote = `\n=== WHO YOU ARE TALKING TO ===\nThe user in this chat is "${contact.name}" — Huzaifa Sahab ka ${contact.relation}. Unse naam le kar baat karo, warm aur familiar tone mein.`;
   } else {
-    whoNote = `\n=== WHO YOU ARE TALKING TO ===\nThis user's name is UNKNOWN to you — but that's FINE. Treat them warmly and helpfully like a good assistant. IMPORTANT: Do NOT ask their name during normal conversation — just answer their questions naturally and completely. Agar wo khud apna naam batayein to use kar sakte ho.`;
+    whoNote = `\n=== WHO YOU ARE TALKING TO ===\nThis user's name is UNKNOWN to you — but that's FINE. Treat them warmly and helpfully. Do NOT ask their name during normal conversation — just answer naturally.`;
   }
 
   return `You are JARVIS — the personal AI assistant of Muhammad Huzaifa Sabir. You chat on WhatsApp on his behalf, like a real human assistant would.
@@ -336,6 +366,11 @@ function systemPromptFor(sender, contact) {
 - Friday & Saturday: not specified
  ${whoNote}
 
+=== ⭐ SPECIAL ABILITY: MESSAGE FORWARDING ⭐
+Tum Huzaifa Sahab tak messages pohancha SAKTE ho! Agar user kahe "Huzaifa Sahab ko message bhejo/ponchao", "can you text/dm him?", "uskoo bata do" — to HAMESHA positive jawab do: "Ji bilkul! Aap apna message likh dijiye, main Huzaifa Sahab tak pohancha dunga ✅"
+KABHI bhi "main forward nahi kar sakta", "I can't send messages", "main sirf AI hoon message nahi bhej sakta" MAT bolo — ye GALAT hai, tum ye kar sakte ho.
+(Zyada tar requests automatic pakki jayengi — ye instruction sirf backup hai.)
+
 === TONE: Real Assistant, NOT ChatGPT ===
 - Baat karo jaise koi friendly, smart, loyal human assistant karta hai — robotic ya over-formal nahi.
 - "I'm an AI language model..." jaise sentences KABHI mat bolo.
@@ -344,7 +379,7 @@ function systemPromptFor(sender, contact) {
 - Known contacts ko naam se address karo — personal touch.
 
 === HOW TO HANDLE THINGS ===
-1. Agar koi Huzaifa Sahab ko dhoondta hai → routine se jawab do: "Huzaifa Sahab abhi University mein honge (Mon-Thu 7AM-2PM) ke hisaab se... lekin main live track nahi kar sakta, exact nahi pata."
+1. Agar koi Huzaifa Sahab ko dhoondta hai (kahan hai/free hai) → routine se jawab do: "Huzaifa Sahab abhi University mein honge (Mon-Thu 7AM-2PM) ke hisaab se... lekin main live track nahi kar sakta, exact nahi pata."
 2. Personal detail jo list mein nahi → casually bolo: "Ye to mujhe nahi pata, wo detail Huzaifa Sahab ne nahi batayi." Kabhi guess/invent mat karo.
 3. Naam, numbers, emails — exact copy karo.
 4. General sawalon ke jawab do — smart aur helpful. Genuinely unsure ho to honestly bolo.
@@ -401,7 +436,7 @@ async function getAIReply(messages) {
         { signal: c.signal }
       ).then(res => {
         let reply = (res.choices[0] && res.choices[0].message.content) || "";
-        reply = reply.replace(/ládno[\s\S]*?<\/think>/gi, '').trim();
+        reply = reply.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
         if (!reply) throw new Error("khaali jawab");
         finish(target, reply);
       }).catch(err => {
@@ -452,13 +487,6 @@ async function startSock() {
 
   const safe = async (fn) => { try { await fn(); } catch (e) {} };
 
-  // Saaf label — @lid ko alag tarah dikhao (wo number nahi hota)
-  function senderLabel(sender) {
-    const rawNum = sender.split('@')[0];
-    if (sender.endsWith('@lid')) return `WhatsApp-ID: ${rawNum}`;
-    return `+${rawNum}`;
-  }
-
   async function notifyOwner(sender, bodyText) {
     try {
       if (sender === BOT_JID) return;
@@ -488,21 +516,25 @@ async function startSock() {
     } catch (e) { console.log('Notify fail:', e && e.message); }
   }
 
-  // ⭐ FORWARD — kisi ka message Huzaifa Sahab tak pohanchana
+  // ⭐ FORWARD — Huzaifa Sahab tak message pohanchana
   async function forwardToOwner(sender, name, messageText) {
     try {
       const fromLabel = senderLabel(sender);
-      const namePart = name ? name : 'Unknown sender';
+      const namePart = name || 'Unknown sender';
       const timeStr = new Date().toLocaleTimeString('en-US', {hour:'2-digit', minute:'2-digit', hour12:true});
       await botSend(BOT_JID, { text:
-`📤 *Huzaifa Sahab, kisi ne aapke liye message bheja hai*
+`📤 *Huzaifa Sahab, kisi ne aapko message bheja hai*
 
 👤 From: ${namePart} (${fromLabel})
 🕐 Waqt: ${timeStr}
 
 💬 ${messageText}` });
       console.log(`📤 Forward ho gaya: ${namePart}`);
-    } catch (e) { console.log('Forward fail:', e && e.message); }
+      return true;
+    } catch (e) {
+      console.log('Forward fail:', e && e.message);
+      return false;
+    }
   }
 
   sock.ev.on('connection.update', async (update) => {
@@ -541,9 +573,8 @@ async function startSock() {
     } else if (connection === 'open') {
       reconnectDelay = 5000;
       const ps = providerStatus();
-      console.log('✅ JARVIS v3.2 is Online!');
+      console.log('✅ JARVIS v3.3 is Online!');
       console.log(`🔌 Groq: ${ps.q} | Google AI: ${ps.g} | OpenRouter: ${ps.or}`);
-      console.log(`🔧 Self JID check — sock.user.id: ${sock.user && sock.user.id} | lid: ${sock.user && sock.user.lid || 'n/a'}`);
     }
   });
 
@@ -616,18 +647,17 @@ async function startSock() {
         const up = Math.floor((Date.now() - stats.started) / 60000);
         const ps = providerStatus();
         await botSend(sender, { text:
-`📊 JARVIS v3.2 Status
+`📊 JARVIS v3.3 Status
 ⏱️ Uptime: ${Math.floor(up/60)}h ${up%60}m
 📨 Served: ${stats.served} | 💬 Replies: ${stats.replies} | ⚠️ Errors: ${stats.errors}
 🧠 Last model: ${lastGoodKey || 'n/a'}
 🔌 Groq: ${ps.q} | Google: ${ps.g} | OpenRouter: ${ps.or}
-📇 Contacts: ${Object.values(learned).filter(c => c.name !== 'unknown').length + staticContacts.length} | 📤 Pending forwards: ${Object.keys(pendingForwards).length}
+📇 Contacts: ${Object.values(learned).filter(c => c.name !== 'unknown').length + staticContacts.length} | 📤 Active forwards: ${Object.keys(forwardFlow).length}
  ${botPaused ? '🔴 Paused' : '🟢 Active'}` });
         return;
       }
       if (cmd === '.notifytest') {
-        console.log('🔔 NotifyTest — sock.user:', JSON.stringify(sock.user && { id: sock.user.id, lid: sock.user.lid }));
-        await botSend(sender, { text: '🔔 Test message khud ki is chat mein bheja gaya hai. Agar YE message phone par saaf dikh raha hai to notifications ka raasta sahi hai!' });
+        await botSend(sender, { text: '🔔 Test message khud ki is chat mein bheja gaya hai. Agar YE saaf dikh raha hai to notifications ka raasta theek hai!' });
         return;
       }
       if (cmd === '.reset') {
@@ -690,44 +720,6 @@ async function startSock() {
       await safe(() => notifyOwner(sender, text));
     }
 
-    // ⭐⭐ FORWARD FEATURE — "ye message Huzaifa tak ponchao" ⭐⭐
-    if (isForwardRequest(text)) {
-      const contact = lookupContact(sender);
-      if (contact && contact.name) {
-        await forwardToOwner(sender, contact.name, text);
-        await botSend(sender, { text: `Ji bilkul! Huzaifa Sahab tak aapka message pohancha diya hai ✅ Unhe bataya hai ke ye aap ne bheja hai.` }, msg);
-        console.log(`📤 Forward request pura hua (${contact.name})`);
-      } else {
-        pendingForwards[sender] = { text, tries: 0 };
-        await botSend(sender, { text: `Ji zaroor! Bas apna naam bata dijiye — phir Huzaifa Sahab ko bhi bata dunga ke ye message kis ne bheja hai 😊` }, msg);
-        console.log(`📤 Forward pending — naam ka intezaar (${sender})`);
-      }
-      return;
-    }
-
-    // ⭐ PENDING FORWARD — naam ka intezaar hai
-    if (pendingForwards[sender]) {
-      const pf = pendingForwards[sender];
-      const maybeName = tryExtractName(text);
-      if (maybeName) {
-        setLearned(sender, maybeName, 'contact');
-        delete pendingForwards[sender];
-        await forwardToOwner(sender, maybeName, pf.text);
-        await botSend(sender, { text: `Shukriya ${maybeName}! Huzaifa Sahab tak aapka message pohanch gaya hai ✅` }, msg);
-        console.log(`📤 Forward complete: ${maybeName}`);
-      } else {
-        pf.tries = (pf.tries || 0) + 1;
-        if (pf.tries >= 2) {
-          delete pendingForwards[sender];
-          await forwardToOwner(sender, null, pf.text);
-          await botSend(sender, { text: `Theek hai — Huzaifa Sahab tak message pohancha diya hai ✅ (naam agli baar bata dijiye ga)` }, msg);
-        } else {
-          await botSend(sender, { text: `Bas naam likh dijiye — jaise: "mera naam Ali hai" — phir foran Huzaifa Sahab tak pohancha dunga 😊` }, msg);
-        }
-      }
-      return;
-    }
-
     if (botPaused) { console.log(`🤫 Paused — ${sender} skip`); return; }
 
     if (chatMuted[sender]) {
@@ -756,22 +748,98 @@ async function startSock() {
     }
     if (cmd === '.help' || cmd === 'help') {
       await botSend(sender, { text:
-`🤖 *JARVIS v3.2* — at your service
+`🤖 *JARVIS v3.3* — at your service
 
 Main Huzaifa Sahab ka AI assistant hoon — kuch bhi pooch lo.
 
 📤 *Message forwarding:*
-"ye message Huzaifa Sahab tak ponchao" likhein — main un tak pohancha dunga ✅
+"ye message Huzaifa Sahab tak ponchao" ya "Huzaifa Sahab ko bata do" — main un tak pohancha dunga ✅
 
 📋 Commands:
 • .time — exact waqt
-• .help — ye list
-
-👥 Group mein mujhe mention ya reply karna zaroori hai.` }, msg);
+• .help — ye list` }, msg);
       return;
     }
 
-    // Passive naam capture (sirf jab khud bataye)
+    // ⭐⭐ STEP 1: Koi FORWARD FLOW CHAL RAHA HAI? (message/name ka intezaar) ⭐⭐
+    if (forwardFlow[sender]) {
+      const ff = forwardFlow[sender];
+
+      // Timeout — 10 min baad flow khud cancel
+      if (Date.now() - ff.startedAt > FORWARD_FLOW_TIMEOUT) {
+        delete forwardFlow[sender];
+        console.log(`⏰ Forward flow timeout (${sender}) — cancel`);
+        // timeout ke baad message aage normal process hoga
+      } else if (cmd === 'cancel' || cmd === '.cancel' || cmd === 'chor do') {
+        delete forwardFlow[sender];
+        await botSend(sender, { text: 'Theek hai — forwarding cancel kar diya. Jab chahiye ho phir bata dena 😊' }, msg);
+        console.log(`🚫 Forward cancel (${sender})`);
+        return;
+      } else if (ff.stage === 'content') {
+        // Ye message hi forward hone wala content hai
+        ff.content = text.trim();
+        const contact = lookupContact(sender);
+        if (contact && contact.name) {
+          const ok = await forwardToOwner(sender, contact.name, ff.content);
+          delete forwardFlow[sender];
+          await botSend(sender, { text: ok
+            ? `Huzaifa Sahab tak aapka message pohanch gaya hai ✅ Unhe bataya gaya hai ke ye aap (${contact.name}) ne bheja hai.`
+            : `Maazrat, message pohanchane mein masla aaya — thori der baad dobara koshish karein.` }, msg);
+        } else {
+          ff.stage = 'name';
+          ff.startedAt = Date.now();
+          await botSend(sender, { text: `Achha, message mil gaya! Bas apna naam bata dijiye — phir Huzaifa Sahab ko bhi bata dunga ke kis ne bheja hai 😊` }, msg);
+        }
+        return;
+      } else if (ff.stage === 'name') {
+        const trimmed = text.trim();
+        let name = tryExtractName(trimmed);
+        if (!name && /^[a-zA-Z\u0600-\u06FF][a-zA-Z\u0600-\u06FF\s.]{1,24}$/.test(trimmed)) {
+          name = trimmed; // sirf naam likha hai ("Ali")
+        }
+        if (name) setLearned(sender, name, 'contact');
+        const useName = name || 'Unknown';
+        const ok = await forwardToOwner(sender, useName, ff.content);
+        delete forwardFlow[sender];
+        await botSend(sender, { text: ok
+          ? `Shukriya${name ? ' ' + name : ''}! Huzaifa Sahab tak aapka message pohanch gaya hai ✅`
+          : `Maazrat, masla aaya — thori der baad dobara try karein.` }, msg);
+        console.log(`📤 Forward complete: ${useName}`);
+        return;
+      }
+    }
+
+    // ⭐⭐ STEP 2: NAYI FORWARD REQUEST? (har tareeqe se) ⭐⭐
+    if (!cmd.startsWith('.') && isForwardIntent(text)) {
+      const contact = lookupContact(sender);
+      const content = extractForwardContent(text);
+
+      if (content) {
+        // Message ke andar hi content tha: "batao ke main kal aaunga"
+        if (contact && contact.name) {
+          const ok = await forwardToOwner(sender, contact.name, content);
+          await botSend(sender, { text: ok
+            ? `Ji bilkul! Huzaifa Sahab tak aapka message pohancha diya hai ✅`
+            : `Maazrat, masla aaya — dobara koshish karein.` }, msg);
+          console.log(`📤 Direct forward (${contact.name})`);
+        } else {
+          forwardFlow[sender] = { stage: 'name', content, startedAt: Date.now() };
+          await botSend(sender, { text: `Ji zaroor! Bas apna naam bata dijiye — phir Huzaifa Sahab ko bhi bata dunga ke ye message kis ne bheja hai 😊` }, msg);
+          console.log(`📤 Forward pending naam ka (${sender})`);
+        }
+      } else {
+        // Content nahi tha — poochho ke kya bhejna hai
+        forwardFlow[sender] = { stage: 'content', content: null, startedAt: Date.now() };
+        await botSend(sender, { text: `Ji bilkul! Main Huzaifa Sahab tak aapka message pohancha dunga ✅
+
+Ab likh dijiye jo message bhejna hai 👇
+(Cancel karna ho to "cancel" likh dein)` }, msg);
+        console.log(`📤 Forward flow start — content ka intezaar (${sender})`);
+      }
+      return;
+    }
+
+    // ===== NORMAL AI REPLY =====
     let contact = lookupContact(sender);
     if (!contact) {
       const maybeName = tryExtractName(text);
